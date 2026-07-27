@@ -17,8 +17,11 @@ from dataclasses import dataclass
 from typing import List, Optional, Tuple, Union
 
 import torch
+from torch.utils.checkpoint import checkpoint as _torch_checkpoint
 import torch.nn as nn
 import torch.nn.functional as F
+
+_EPS = 1e-6
 
 
 # ---------------------------------------------------------------------------
@@ -148,8 +151,80 @@ def _slstm_recurrent_scan(
 
         c = f_prime * c + i_prime * z
         n = f_prime * n + i_prime
-        h = o * (c / n.clamp_min(1e-6))
+        h = o * (c / n.clamp_min(_EPS))
 
+        outputs[:, t] = h.reshape(B, hidden_size)
+
+    return outputs, c, n, m, h
+
+
+@torch.compile(dynamic=True)
+def _slstm_step_compiled(
+    z_t: torch.Tensor,
+    i_t: torch.Tensor,
+    f_t: torch.Tensor,
+    o_t: torch.Tensor,
+    h_prev: torch.Tensor,
+    Rz: torch.Tensor,
+    Ri: torch.Tensor,
+    Rf: torch.Tensor,
+    Ro: torch.Tensor,
+    c: torch.Tensor,
+    n: torch.Tensor,
+    m: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Fused single timestep of sLSTM (compiled via torch.compile)."""
+    z_tilde = z_t + torch.einsum("bhd,hde->bhe", h_prev, Rz)
+    i_tilde = i_t + torch.einsum("bhd,hde->bhe", h_prev, Ri)
+    f_tilde = f_t + torch.einsum("bhd,hde->bhe", h_prev, Rf)
+    o_tilde = o_t + torch.einsum("bhd,hde->bhe", h_prev, Ro)
+
+    z = torch.tanh(z_tilde)
+    o = torch.sigmoid(o_tilde)
+    log_f = F.logsigmoid(f_tilde)
+
+    m_new = torch.maximum(log_f + m, i_tilde)
+    i_prime = torch.exp(i_tilde - m_new)
+    f_prime = torch.exp(log_f + m - m_new)
+
+    c_new = f_prime * c + i_prime * z
+    n_new = f_prime * n + i_prime
+    h_new = o * (c_new / n_new.clamp_min(_EPS))
+
+    return c_new, n_new, m_new, h_new
+
+
+def _slstm_recurrent_scan_optimized(
+    z_in: torch.Tensor,
+    i_in: torch.Tensor,
+    f_in: torch.Tensor,
+    o_in: torch.Tensor,
+    Rz: torch.Tensor,
+    Ri: torch.Tensor,
+    Rf: torch.Tensor,
+    Ro: torch.Tensor,
+    c: torch.Tensor,
+    n: torch.Tensor,
+    m: torch.Tensor,
+    h: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Run the sLSTM recurrence using a compiled per-step kernel.
+
+    Mathematically identical to :func:`_slstm_recurrent_scan` but uses
+    ``torch.compile`` on the step body to fuse ~12 GPU kernel launches
+    into 2-3 fused kernels per timestep.
+    """
+    B, T, H, Dh = z_in.shape
+    hidden_size = H * Dh
+
+    outputs = z_in.new_empty(B, T, hidden_size)
+
+    for t in range(T):
+        ht = h
+        c, n, m, h = _slstm_step_compiled(
+            z_in[:, t], i_in[:, t], f_in[:, t], o_in[:, t],
+            ht, Rz, Ri, Rf, Ro, c, n, m,
+        )
         outputs[:, t] = h.reshape(B, hidden_size)
 
     return outputs, c, n, m, h
@@ -192,12 +267,10 @@ class sLSTMCell(nn.Module):
 
     def reset_parameters(self) -> None:
         std = 1.0 / math.sqrt(self.hidden_size)
-        for w in (self.Wz, self.Wi):
-            nn.init.normal_(w.weight, std=std)
-        nn.init.xavier_normal_(self.Wo.weight)
+        nn.init.normal_(self.Wz.weight, std=std)
+        nn.init.normal_(self.Wi.weight, std=std)
         nn.init.normal_(self.Wf.weight, std=1e-2)
-        if self.Wf.bias is not None:
-            nn.init.constant_(self.Wf.bias, 0.0)
+        nn.init.xavier_normal_(self.Wo.weight)
         for R in (self.Rz, self.Ri, self.Rf, self.Ro):
             nn.init.orthogonal_(R)
 
@@ -224,7 +297,7 @@ class sLSTMCell(nn.Module):
 
         c_new = f_prime * state.c + i_prime * z
         n_new = f_prime * state.n + i_prime
-        h_new = o * (c_new / n_new.clamp_min(1e-6))
+        h_new = o * (c_new / n_new.clamp_min(_EPS))
 
         return h_new.reshape(B, self.hidden_size), sLSTMState(c_new, n_new, m_new, h_new)
 
@@ -269,6 +342,7 @@ class sLSTM(nn.Module):
         bias: bool = True,
         batch_first: bool = False,
         pack_state: bool = True,
+        use_checkpoint: bool = False,
     ):
         super().__init__()
 
@@ -284,6 +358,7 @@ class sLSTM(nn.Module):
         self.bidirectional = bidirectional
         self.num_directions = 2 if bidirectional else 1
         self.batch_first = batch_first
+        self.use_checkpoint = use_checkpoint
         self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
 
         for d in range(self.num_directions):
@@ -307,14 +382,14 @@ class sLSTM(nn.Module):
         std = 1.0 / math.sqrt(self.hidden_size)
         for d in range(self.num_directions):
             for l in range(self.num_layers):
-                getattr(self, f"Wz_{d}_{l}").reset_parameters()
-                getattr(self, f"Wi_{d}_{l}").reset_parameters()
-                getattr(self, f"Wf_{d}_{l}").reset_parameters()
-                getattr(self, f"Wo_{d}_{l}").reset_parameters()
                 nn.init.normal_(getattr(self, f"Wz_{d}_{l}").weight, std=std)
                 nn.init.normal_(getattr(self, f"Wi_{d}_{l}").weight, std=std)
                 nn.init.normal_(getattr(self, f"Wf_{d}_{l}").weight, std=1e-2)
                 nn.init.xavier_normal_(getattr(self, f"Wo_{d}_{l}").weight)
+                for gate in ("Wz", "Wi", "Wf", "Wo"):
+                    lin = getattr(self, f"{gate}_{d}_{l}")
+                    if lin.bias is not None:
+                        nn.init.zeros_(lin.bias)
                 for gate in ("Rz", "Ri", "Rf", "Ro"):
                     nn.init.orthogonal_(getattr(self, f"{gate}_{d}_{l}"))
 
@@ -365,7 +440,11 @@ class sLSTM(nn.Module):
         Rf = getattr(self, f"Rf_{d}_{l}")
         Ro = getattr(self, f"Ro_{d}_{l}")
 
-        return _slstm_recurrent_scan(
+        if self.use_checkpoint and self.training:
+            return _slstm_recurrent_scan(
+                z_in, i_in, f_in, o_in, Rz, Ri, Rf, Ro, c, n, m, h,
+            )
+        return _slstm_recurrent_scan_optimized(
             z_in, i_in, f_in, o_in, Rz, Ri, Rf, Ro, c, n, m, h,
         )
 
@@ -408,9 +487,15 @@ class sLSTM(nn.Module):
                 m_dl = s_l.m[d]
                 h_dl = s_l.h[d]
 
-                out, c_out, n_out, m_out, h_out = self._run_layer(
-                    layer_input, d, l, c_dl, n_dl, m_dl, h_dl,
-                )
+                if self.use_checkpoint and self.training:
+                    out, c_out, n_out, m_out, h_out = _torch_checkpoint(
+                        self._run_layer, layer_input, d, l, c_dl, n_dl, m_dl, h_dl,
+                        use_reentrant=False,
+                    )
+                else:
+                    out, c_out, n_out, m_out, h_out = self._run_layer(
+                        layer_input, d, l, c_dl, n_dl, m_dl, h_dl,
+                    )
 
                 if d == 1:
                     out = torch.flip(out, [1])
@@ -445,3 +530,10 @@ class sLSTM(nn.Module):
 
     def flatten_parameters(self) -> None:
         pass
+
+    def __repr__(self) -> str:
+        return (
+            f"sLSTM(input_size={self.input_size}, hidden_size={self.hidden_size}, "
+            f"num_layers={self.num_layers}, bidirectional={self.bidirectional}, "
+            f"batch_first={self.batch_first}, use_checkpoint={self.use_checkpoint})"
+        )

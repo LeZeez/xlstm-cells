@@ -39,6 +39,11 @@ def zero_rows(
     is applied — this zeroes the masked rows while preserving the leading
     dimension (num_directions) and all other dimensions.
 
+    .. warning::
+        Only call on detached states.  If any tensor in the state is still
+        attached to the autograd graph, in-place modification will raise an
+        error (or silently corrupt gradients on older PyTorch versions).
+
     Usage::
 
         zero_rows(states, mask)            # mask = torch.tensor([True, False, False])
@@ -52,4 +57,9 @@ def zero_rows(
     elif hasattr(states, "__dataclass_fields__"):
         for fname in states.__dataclass_fields__:
             tensor = getattr(states, fname)
+            if tensor.requires_grad:
+                raise RuntimeError(
+                    f"zero_rows: tensor '{fname}' requires grad. "
+                    f"Detach states first with detach_states()."
+                )
             tensor[:, mask] = 0

@@ -47,9 +47,14 @@ class mLSTMBlock(nn.Module):
         conv_kernel: int = 4,
         dropout: float = 0.0,
         bias: bool = True,
+        use_checkpoint: bool = False,
     ):
         super().__init__()
         expanded = d_model * expand_factor
+        assert expanded % num_heads == 0, (
+            f"expanded ({expanded}) must be divisible by num_heads ({num_heads}). "
+            f"Choose expand_factor such that d_model * expand_factor % num_heads == 0."
+        )
         self.expanded = expanded
         self.num_heads = num_heads
         self.conv_kernel = conv_kernel
@@ -79,6 +84,7 @@ class mLSTMBlock(nn.Module):
             bias=bias,
             batch_first=True,
             pack_state=False,
+            use_checkpoint=use_checkpoint,
         )
 
         # --- head-wise normalization after LSTM ---
@@ -161,8 +167,12 @@ class sLSTMBlock(nn.Module):
         conv_kernel: int = 4,
         dropout: float = 0.0,
         bias: bool = False,
+        use_checkpoint: bool = False,
     ):
         super().__init__()
+        assert d_model % num_heads == 0, (
+            f"d_model ({d_model}) must be divisible by num_heads ({num_heads}) for GroupNorm."
+        )
         expanded = int(d_model * expand_factor)
         self.expanded = expanded
         self.num_heads = num_heads
@@ -189,6 +199,7 @@ class sLSTMBlock(nn.Module):
             bias=bias,
             batch_first=True,
             pack_state=False,
+            use_checkpoint=use_checkpoint,
         )
 
         # head-wise normalization after sLSTM
