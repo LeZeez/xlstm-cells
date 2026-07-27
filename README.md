@@ -1,8 +1,6 @@
 # xlstm-cells
 
-Pure-PyTorch mLSTM & sLSTM implementing the xLSTM paper (Beck et al., 2024).
-No Triton, no `mlstm_kernels`, no config dataclasses — just tensors and
-autograd.
+Pure-PyTorch mLSTM & sLSTM implementing the xLSTM paper (Beck et al., 2024) with slight similarity to `torch.nn.LSTM` structure.
 
 ```bash
 pip install git+https://github.com/LeZeez/xlstm-cells.git
