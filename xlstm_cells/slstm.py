@@ -261,9 +261,14 @@ class sLSTM(nn.Module):
         batch_first:   (batch, seq, feature) if True (default True)
         pack_state:    if True, states are always packed in a tuple (default True)
         use_checkpoint:  if True, use activation checkpointing (default False)
-        fast_mode:     compile the per-layer scan with ``torch.compile(dynamic=True)``.
-                       One compilation per shape, then zero dispatch overhead.
+        fast_mode:     compile the per-layer scan chunk-by-chunk with
+                       ``torch.compile(dynamic=False)``.  Compile time is
+                       O(fast_chunk_size), not O(sequence length).
                        Works in both train and eval.  False by default.
+        fast_chunk_size: number of timesteps unrolled per compiled graph when
+                       ``fast_mode=True`` (default 32).  Larger chunks fuse
+                       more aggressively but cost more to compile once; smaller
+                       chunks compile faster.  Only matters when ``fast_mode=True``.
     """
 
     def __init__(
@@ -279,6 +284,7 @@ class sLSTM(nn.Module):
         pack_state: bool = True,
         use_checkpoint: bool = False,
         fast_mode: bool = False,
+        fast_chunk_size: int = 32,
     ):
         super().__init__()
 
@@ -296,9 +302,10 @@ class sLSTM(nn.Module):
         self.batch_first = batch_first
         self.use_checkpoint = use_checkpoint
         self.fast_mode = fast_mode
+        self.fast_chunk_size = fast_chunk_size
         self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
 
-        self._compiled_run = None
+        self._compiled_chunk = None
 
         for d in range(self.num_directions):
             for l in range(num_layers):
@@ -381,14 +388,34 @@ class sLSTM(nn.Module):
         all_in = self._project_sequence(x, d, l)
         R_fused = self._fuse_r_weights(d, l)
 
-        if self.fast_mode:
-            if self._compiled_run is None:
-                self._compiled_run = torch.compile(
-                    _slstm_scan_sequential, dynamic=True,
-                )
-            return self._compiled_run(all_in, R_fused, c, n, m, h)
-        else:
+        if not self.fast_mode:
             return _slstm_scan_sequential(all_in, R_fused, c, n, m, h)
+
+        if self._compiled_chunk is None:
+            self._compiled_chunk = torch.compile(
+                _slstm_scan_sequential, dynamic=False,
+            )
+
+        T = all_in.shape[1]
+        C = self.fast_chunk_size
+        outputs_chunks = []
+
+        t = 0
+        while t + C <= T:
+            out_c, c, n, m, h = self._compiled_chunk(
+                all_in[:, t:t + C], R_fused, c, n, m, h,
+            )
+            outputs_chunks.append(out_c)
+            t += C
+
+        if t < T:
+            out_c, c, n, m, h = _slstm_scan_sequential(
+                all_in[:, t:], R_fused, c, n, m, h,
+            )
+            outputs_chunks.append(out_c)
+
+        outputs = torch.cat(outputs_chunks, dim=1)
+        return outputs, c, n, m, h
 
     def forward(self, input: torch.Tensor, state=None):
         if not self.batch_first:
@@ -481,5 +508,5 @@ class sLSTM(nn.Module):
             f"sLSTM(input_size={self.input_size}, hidden_size={self.hidden_size}, "
             f"num_layers={self.num_layers}, bidirectional={self.bidirectional}, "
             f"batch_first={self.batch_first}, use_checkpoint={self.use_checkpoint}, "
-            f"fast_mode={self.fast_mode})"
+            f"fast_mode={self.fast_mode}, fast_chunk_size={self.fast_chunk_size})"
         )

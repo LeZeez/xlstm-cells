@@ -195,6 +195,7 @@ class sLSTMBlock(nn.Module):
         bias: bool = False,
         use_checkpoint: bool = False,
         fast_mode: bool = False,
+        fast_chunk_size: int = 32,
     ):
         super().__init__()
         assert d_model % num_heads == 0, (
@@ -226,6 +227,7 @@ class sLSTMBlock(nn.Module):
             pack_state=False,
             use_checkpoint=use_checkpoint,
             fast_mode=fast_mode,
+            fast_chunk_size=fast_chunk_size,
         )
 
         self.gn = nn.GroupNorm(num_heads, d_model)
