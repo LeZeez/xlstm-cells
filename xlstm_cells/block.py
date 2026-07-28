@@ -1,14 +1,14 @@
 """
-xLSTM Blocks — paper-compliant residual blocks with GroupNorm, causal conv, gating.
+xLSTM Blocks -- paper-compliant residual blocks with GroupNorm, causal conv, gating.
 
 These are the fundamental building blocks, not customizable wrappers.
 They wrap the bare mLSTM/sLSTM cells with the full paper architecture:
 
     mLSTMBlock (pre up-projection, Figure 11):
-        LN → up-project → Conv1d(causal) → mLSTM → GroupNorm → gate → down-project + residual
+        LN -> up-project -> Conv1d(causal) -> mLSTM -> GroupNorm -> gate -> down-project + residual
 
     sLSTMBlock (post up-projection, Figure 10):
-        LN → [Conv1d] → sLSTM → GroupNorm → up-project → gated MLP → down-project + residual
+        LN -> [Conv1d] -> sLSTM -> GroupNorm -> up-project -> gated MLP -> down-project + residual
 """
 
 from __future__ import annotations
@@ -21,14 +21,47 @@ from typing import Optional, Tuple
 from .mlstm import mLSTM, mLSTMState
 from .slstm import sLSTM, sLSTMState
 
+_GN_EPS = 1e-5
+
+
+def _group_norm_bhwc(
+    x: torch.Tensor, num_groups: int, weight: torch.Tensor,
+    bias: torch.Tensor, eps: float = _GN_EPS,
+) -> torch.Tensor:
+    """GroupNorm working directly on (B, T, C) layout -- no transposes.
+
+    Equivalent to ``nn.GroupNorm(groups, C)`` applied to (B, C, T) but
+    operates via reshape so that the tensor stays contiguous.  This eliminates
+    two ``aten::copy_`` calls per block per forward pass.
+
+    Normalisation is computed over (T, D) for each (B, G) where
+    D = C // G, matching the standard GroupNorm semantics.
+    """
+    B, T, C = x.shape
+    G = num_groups
+    D = C // G
+
+    y = x.reshape(B, T, G, D)
+
+    mean = y.mean(dim=(1, 3), keepdim=True)
+    var = y.var(dim=(1, 3), keepdim=True, unbiased=False)
+    y = (y - mean) / torch.sqrt(var + eps)
+
+    y = y.reshape(B, T, C)
+    if weight is not None:
+        y = y * weight
+    if bias is not None:
+        y = y + bias
+    return y
+
 
 class mLSTMBlock(nn.Module):
     """Paper-compliant mLSTM block with pre up-projection.
 
     Architecture (Figure 11 from Beck et al. 2024):
-        x → LayerNorm ─┬→ gate_proj → sigmoid → gate
-                        └→ up_proj → Conv1d(causal) → Swish → mLSTM → GroupNorm
-                              → gate * lstm_out + learnable_skip → down_proj + x
+        x -> LayerNorm -+-> gate_proj -> sigmoid -> gate
+                        +-> up_proj -> Conv1d(causal) -> Swish -> mLSTM -> GroupNorm
+                              -> gate * lstm_out + learnable_skip -> down_proj + x
 
     Args:
         d_model:        input & output feature dimension
@@ -48,6 +81,7 @@ class mLSTMBlock(nn.Module):
         dropout: float = 0.0,
         bias: bool = True,
         use_checkpoint: bool = False,
+        use_triton_kernels: bool = True,
     ):
         super().__init__()
         expanded = d_model * expand_factor
@@ -61,11 +95,7 @@ class mLSTMBlock(nn.Module):
 
         self.ln = nn.LayerNorm(d_model)
 
-        # --- gate path: produces sigmoid gate from normed input ---
-        self.gate_proj = nn.Linear(d_model, expanded, bias=bias)
-
-        # --- lstm path: up-project → conv → lstm ---
-        self.up_proj = nn.Linear(d_model, expanded, bias=bias)
+        self.fused_proj = nn.Linear(d_model, 2 * expanded, bias=bias)
 
         if conv_kernel > 0:
             self.conv = nn.Conv1d(
@@ -85,15 +115,13 @@ class mLSTMBlock(nn.Module):
             batch_first=True,
             pack_state=False,
             use_checkpoint=use_checkpoint,
+            use_triton_kernels=use_triton_kernels,
         )
 
-        # --- head-wise normalization after LSTM ---
         self.gn = nn.GroupNorm(num_heads, expanded)
 
-        # --- learnable skip (per-channel scalar added post-conv) ---
         self.learnable_skip = nn.Parameter(torch.zeros(1, 1, expanded))
 
-        # --- back to d_model ---
         self.down_proj = nn.Linear(expanded, d_model, bias=bias)
         self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
 
@@ -110,11 +138,9 @@ class mLSTMBlock(nn.Module):
         residual = x
         x = self.ln(x)
 
-        # gate from normed input
-        gate = torch.sigmoid(self.gate_proj(x))   # (B, T, expanded)
-
-        # lstm path
-        h = self.up_proj(x)                        # (B, T, expanded)
+        fused = self.fused_proj(x)                 # (B, T, 2*expanded)
+        gate_raw, h = fused.chunk(2, dim=-1)       # each (B, T, expanded)
+        gate = torch.sigmoid(gate_raw)
 
         if self.conv is not None:
             h = h.transpose(1, 2)                  # (B, expanded, T) for Conv1d
@@ -127,10 +153,10 @@ class mLSTMBlock(nn.Module):
 
         h, state = self.lstm(h, state)              # mLSTM recurrence
 
-        # head-wise norm
-        h = h.transpose(1, 2)                       # (B, expanded, T)
-        h = self.gn(h)
-        h = h.transpose(1, 2)                       # (B, T, expanded)
+        gn_weight = self.gn.weight
+        gn_bias = self.gn.bias
+        gn_eps = self.gn.eps
+        h = _group_norm_bhwc(h, self.num_heads, gn_weight, gn_bias, gn_eps)
 
         h = gate * h                                 # apply external output gate
 
@@ -147,12 +173,12 @@ class sLSTMBlock(nn.Module):
     """Paper-compliant sLSTM block with post up-projection.
 
     Architecture (Figure 10 from Beck et al. 2024):
-        x → LayerNorm → [Conv1d] → sLSTM → GroupNorm ─→ up_proj → GeLU ─→ down_proj + x
-                                                     └→ gate_proj → sigmoid ┘
+        x -> LayerNorm -> [Conv1d] -> sLSTM -> GroupNorm -> up_proj -> GeLU -> down_proj + x
+                                                     +-> gate_proj -> sigmoid -+
 
     Args:
         d_model:        input & output feature dimension
-        expand_factor:  post up-projection multiplier (paper uses 4/3 ≈ 1.33)
+        expand_factor:  post up-projection multiplier (paper uses 4/3 ~ 1.33)
         num_heads:      number of sLSTM heads
         conv_kernel:    causal conv1d kernel size (paper uses 4, set 0 to disable)
         dropout:        dropout on output
@@ -168,6 +194,7 @@ class sLSTMBlock(nn.Module):
         dropout: float = 0.0,
         bias: bool = False,
         use_checkpoint: bool = False,
+        fast_mode: bool = False,
     ):
         super().__init__()
         assert d_model % num_heads == 0, (
@@ -180,7 +207,6 @@ class sLSTMBlock(nn.Module):
 
         self.ln = nn.LayerNorm(d_model)
 
-        # optional causal conv on input
         if conv_kernel > 0:
             self.conv = nn.Conv1d(
                 d_model, d_model,
@@ -191,7 +217,6 @@ class sLSTMBlock(nn.Module):
         else:
             self.conv = None
 
-        # sLSTM operates at d_model (no pre up-projection)
         self.lstm = sLSTM(
             d_model, d_model,
             num_layers=1,
@@ -200,14 +225,12 @@ class sLSTMBlock(nn.Module):
             batch_first=True,
             pack_state=False,
             use_checkpoint=use_checkpoint,
+            fast_mode=fast_mode,
         )
 
-        # head-wise normalization after sLSTM
         self.gn = nn.GroupNorm(num_heads, d_model)
 
-        # post up-projection (gated MLP)
-        self.up_proj = nn.Linear(d_model, expanded, bias=bias)
-        self.gate_proj = nn.Linear(d_model, expanded, bias=bias)
+        self.fused_proj = nn.Linear(d_model, 2 * expanded, bias=bias)
         self.down_proj = nn.Linear(expanded, d_model, bias=bias)
         self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
 
@@ -219,7 +242,6 @@ class sLSTMBlock(nn.Module):
         residual = x
         x = self.ln(x)
 
-        # optional causal conv before LSTM
         if self.conv is not None:
             c = x.transpose(1, 2)                  # (B, d_model, T)
             c = F.pad(c, (self.conv_kernel - 1, 0))
@@ -229,14 +251,15 @@ class sLSTMBlock(nn.Module):
 
         x, state = self.lstm(x, state)              # sLSTM recurrence
 
-        # head-wise norm
-        x = x.transpose(1, 2)
-        x = self.gn(x)
-        x = x.transpose(1, 2)
+        gn_weight = self.gn.weight
+        gn_bias = self.gn.bias
+        gn_eps = self.gn.eps
+        x = _group_norm_bhwc(x, self.num_heads, gn_weight, gn_bias, gn_eps)
 
-        # post up-projection: gated MLP
-        gate = torch.sigmoid(self.gate_proj(x))     # (B, T, expanded)
-        up = F.gelu(self.up_proj(x))                # (B, T, expanded)
+        fused = self.fused_proj(x)                  # (B, T, 2*expanded)
+        gate_raw, up_raw = fused.chunk(2, dim=-1)   # each (B, T, expanded)
+        gate = torch.sigmoid(gate_raw)
+        up = F.gelu(up_raw)
         x = gate * up
         x = self.down_proj(x)
         x = self.dropout(x)

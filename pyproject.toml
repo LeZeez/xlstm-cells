@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "xlstm-cells"
-version = "0.4.0"
+version = "0.5.0"
 description = "Fast, pip-installable mLSTM and sLSTM cells with nn.LSTM-compatible interface. Pure PyTorch."
 readme = "README.md"
 requires-python = ">=3.9"
@@ -29,6 +29,9 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
     "pytest>=7.0",
+]
+kernels = [
+    "mlstm_kernels",
 ]
 
 [tool.setuptools.packages.find]
