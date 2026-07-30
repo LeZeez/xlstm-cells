@@ -1,6 +1,6 @@
 # xlstm-cells
 
-Pure-PyTorch mLSTM & sLSTM implementing the xLSTM paper (Beck et al., 2024) with slight similarity to `torch.nn.LSTM` structure.
+Pure-PyTorch mLSTM & sLSTM implementing the xLSTM paper (Beck et al., 2024) with slight similarity to `torch.nn.LSTM` structure. (optional `mlstm_kernels` support)
 
 ```bash
 pip install git+https://github.com/LeZeez/xlstm-cells.git
@@ -12,14 +12,19 @@ pip install git+https://github.com/LeZeez/xlstm-cells.git
 |---|---|
 | `mLSTMCell` | `mLSTMCell(input_size, hidden_size, num_heads=4)` — single-step recurrence |
 | `sLSTMCell` | `sLSTMCell(input_size, hidden_size, num_heads=4)` — single-step recurrence, block-diagonal per head |
-| `mLSTM` | `mLSTM(input_size, hidden_size, num_layers=1, num_heads=4, bidirectional=False, dropout=0, bias=True, batch_first=False)` |
-| `sLSTM` | `sLSTM(input_size, hidden_size, num_layers=1, num_heads=4, bidirectional=False, dropout=0, bias=True, batch_first=False)` |
-| `mLSTMBlock` | `mLSTMBlock(d_model, expand_factor=2, num_heads=4, conv_kernel=4, dropout=0, bias=True)` — Figure 11 residual block |
-| `sLSTMBlock` | `sLSTMBlock(d_model, expand_factor=4/3, num_heads=4, conv_kernel=4, dropout=0, bias=False)` — Figure 10 residual block |
+| `mLSTM` | `mLSTM(input_size, hidden_size, num_layers=1, num_heads=4, bidirectional=False, dropout=0, bias=True, batch_first=False)` — full sequence |
+| `sLSTM` | `sLSTM(input_size, hidden_size, num_layers=1, num_heads=4, bidirectional=False, dropout=0, bias=True, batch_first=False)` — full sequence |
+| `mLSTMBlock` | `mLSTMBlock(d_model, expand_factor=2, num_heads=4, conv_kernel=4, dropout=0, bias=True)` — [Figure 11 residual block in the original paper](https://arxiv.org/pdf/2405.04517#page=30) |
+| `sLSTMBlock` | `sLSTMBlock(d_model, expand_factor=4/3, num_heads=4, conv_kernel=4, dropout=0, bias=False)` — [Figure 10 residual block in the original paper](https://arxiv.org/pdf/2405.04517#page=29) |
 | `mLSTMState` | Dataclass with `.C`, `.n`, `.m` fields |
 | `sLSTMState` | Dataclass with `.c`, `.n`, `.m`, `.h` fields |
+
+## Functions
+
+| Function | Usage |
+|---|---|
 | `detach_states` | `detach_states(states)` — recursively detach all tensors in nested dict/list/tuple/state |
-| `zero_rows` | `zero_rows(states, mask)` — in-place zero selected batch rows across nested states |
+| `zero_rows` | `zero_rows(states, mask)` — in-place zero selected batch rows across nested states (`mask` is a tensor of bools corresponding to the index of the batch you want to zero — `True` = zero)|
 
 ## Quick example
 
@@ -60,25 +65,6 @@ output, states = lstm(x)                     # states = tuple of mLSTMState, one
 
 # output: (8, 50, 512)  — hidden_size * 2 for bidirectional
 # states[0].C: (2, 8, 4, 64, 64)  — (D=2, B, H, Dh, Dh)
-```
-
-### Truncated BPTT
-
-```python
-import torch
-from xlstm_cells import mLSTM
-
-layer = mLSTM(128, 256, num_layers=2, batch_first=True)
-x = torch.randn(8, 100, 128)
-chunk_size = 10
-
-states = None
-for start in range(0, 100, chunk_size):
-    chunk = x[:, start:start + chunk_size]
-    output, states = layer(chunk, states)
-    loss = output.sum()
-    loss.backward()
-    states = tuple(s.detach() for s in states)   # truncate gradients
 ```
 
 ### Residual blocks (paper architecture)
