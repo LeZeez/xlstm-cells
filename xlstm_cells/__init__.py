@@ -28,7 +28,7 @@ from .slstm import sLSTMCell, sLSTM, sLSTMState
 from .block import mLSTMBlock, sLSTMBlock
 from ._utils import detach_states, zero_rows
 
-__version__ = "0.5.1"
+__version__ = "0.5.2"
 __all__ = [
     "mLSTMCell",
     "mLSTM",

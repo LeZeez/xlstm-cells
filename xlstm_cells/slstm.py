@@ -3,11 +3,10 @@ sLSTM: Scalar-memory LSTM cell with block-diagonal (per-head) recurrence.
 
 Optimized:
 1. Input projections fused into a single F.linear call (4->1 GEMM per layer).
-2. Recurrent weights fused into a single einsum (4->1 per step).
-3. ``fast_mode=True`` compiles the full per-layer computation (projection +
-   sequential scan) with ``torch.compile(dynamic=True)``.  This gives
-   inductor-level kernel fusion across the entire sequence while only
-   incurring one compilation per shape -- not per chunk.
+2. Recurrent weights stored as a single fused parameter (no torch.cat on forward).
+3. ``fast_mode=True`` compiles the sequential scan (recurrence loop) chunk-by-chunk
+   with ``torch.compile(dynamic=False)``.  Compile time is O(fast_chunk_size),
+   not O(sequence length).
 4. nn.LSTM-compatible: multi-layer, bidirectional, dropout, batch_first.
 """
 
@@ -108,7 +107,7 @@ def _slstm_scan_sequential(
     B, T, H, Dh_x4 = all_in.shape
     Dh = Dh_x4 // 4
     hidden_size = H * Dh
-    outputs = all_in.new_empty(B, T, hidden_size)
+    output_list: List[torch.Tensor] = []
 
     for t in range(T):
         all_tilde = all_in[:, t] + torch.einsum("bhd,hde->bhe", h, R_fused)
@@ -127,13 +126,14 @@ def _slstm_scan_sequential(
         h = o * (c / n.clamp_min(_eps_local))
         m = m_new
 
-        outputs[:, t] = h.reshape(B, hidden_size)
+        output_list.append(h.reshape(B, hidden_size))
 
+    outputs = torch.stack(output_list, dim=1)
     return outputs, c, n, m, h
 
 
 # ---------------------------------------------------------------------------
-# Eager fallback -- for environments without torch.compile, for debugging
+# Eager reference -- for environments without torch.compile, for testing
 # ---------------------------------------------------------------------------
 
 def _slstm_recurrent_scan(
@@ -141,15 +141,13 @@ def _slstm_recurrent_scan(
     Rz: torch.Tensor, Ri: torch.Tensor, Rf: torch.Tensor, Ro: torch.Tensor,
     c: torch.Tensor, n: torch.Tensor, m: torch.Tensor, h: torch.Tensor,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Eager fallback: sLSTM recurrence over pre-computed projections.
+    """Reference implementation for testing only. Not used by any module at runtime.
 
-    Internally fuses R matrices into a single einsum per step.
-    Kept for environments without torch.compile and for debugging.
-    The 12-arg signature is preserved for backward compatibility.
+    Separate-argument signature kept for backward compatibility with tests.
     """
     B, T, H, Dh = z_in.shape
     hidden_size = H * Dh
-    outputs = z_in.new_empty(B, T, hidden_size)
+    output_list: List[torch.Tensor] = []
 
     R_fused = torch.cat([Rz, Ri, Rf, Ro], dim=-1)
     all_in = torch.cat([z_in, i_in, f_in, o_in], dim=-1)
@@ -167,8 +165,9 @@ def _slstm_recurrent_scan(
         n = f_prime * n + i_prime
         h = o * (c / n.clamp_min(_EPS))
         m = m_new
-        outputs[:, t] = h.reshape(B, hidden_size)
+        output_list.append(h.reshape(B, hidden_size))
 
+    outputs = torch.stack(output_list, dim=1)
     return outputs, c, n, m, h
 
 
@@ -181,6 +180,8 @@ class sLSTMCell(nn.Module):
 
     Recurrent weights are block-diagonal per head -- each head only sees its
     own previous hidden slice, matching the paper's design.
+
+    Weights are stored as fused parameters to avoid torch.cat on every step.
     """
 
     def __init__(self, input_size: int, hidden_size: int, num_heads: int = 4):
@@ -192,26 +193,33 @@ class sLSTMCell(nn.Module):
         self.head_dim = hidden_size // num_heads
         Dh = self.head_dim
 
-        self.Wz = nn.Linear(input_size, hidden_size, bias=False)
-        self.Wi = nn.Linear(input_size, hidden_size, bias=False)
-        self.Wf = nn.Linear(input_size, hidden_size, bias=False)
-        self.Wo = nn.Linear(input_size, hidden_size, bias=False)
+        # Fused input projection: [Wz; Wi; Wf; Wo] as one linear
+        self.W_all = nn.Linear(input_size, 4 * hidden_size, bias=False)
 
-        self.Rz = nn.Parameter(torch.empty(num_heads, Dh, Dh))
-        self.Ri = nn.Parameter(torch.empty(num_heads, Dh, Dh))
-        self.Rf = nn.Parameter(torch.empty(num_heads, Dh, Dh))
-        self.Ro = nn.Parameter(torch.empty(num_heads, Dh, Dh))
+        # Fused recurrent weights: [Rz | Ri | Rf | Ro] concatenated on last dim
+        self.R_fused = nn.Parameter(torch.empty(num_heads, Dh, 4 * Dh))
 
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
         std = 1.0 / math.sqrt(self.hidden_size)
-        nn.init.normal_(self.Wz.weight, std=std)
-        nn.init.normal_(self.Wi.weight, std=std)
-        nn.init.normal_(self.Wf.weight, std=1e-2)
-        nn.init.xavier_normal_(self.Wo.weight)
-        for R in (self.Rz, self.Ri, self.Rf, self.Ro):
-            nn.init.orthogonal_(R)
+        Dh = self.head_dim
+        HS = self.hidden_size
+        # Initialize each gate's slice of the fused weight
+        # W_all.weight is (4*HS, input_size), rows: [Wz | Wi | Wf | Wo]
+        w = self.W_all.weight.data
+        nn.init.normal_(w[:HS], std=std)          # Wz
+        nn.init.normal_(w[HS:2*HS], std=std)      # Wi
+        nn.init.normal_(w[2*HS:3*HS], std=1e-2)   # Wf
+        nn.init.xavier_normal_(w[3*HS:4*HS])      # Wo
+        # R_fused is (H, Dh, 4*Dh), columns: [Rz | Ri | Rf | Ro]
+        # orthogonal_ needs contiguous memory, so init into temp and copy back
+        R = self.R_fused.data
+        for h in range(self.num_heads):
+            for g in range(4):
+                tmp = torch.empty_like(R[h, :, g*Dh:(g+1)*Dh])
+                nn.init.orthogonal_(tmp)
+                R[h, :, g*Dh:(g+1)*Dh] = tmp
 
     def init_state(self, batch_size: int, device=None, dtype=None) -> sLSTMState:
         return sLSTMState.init(batch_size, self.num_heads, self.head_dim, device, dtype)
@@ -220,12 +228,8 @@ class sLSTMCell(nn.Module):
         B = x_t.size(0)
         H, Dh = self.num_heads, self.head_dim
 
-        w_all = torch.cat([self.Wz.weight, self.Wi.weight,
-                           self.Wf.weight, self.Wo.weight], dim=0)
-        wx = F.linear(x_t, w_all, None).view(B, H, 4 * Dh)
-
-        R_fused = torch.cat([self.Rz, self.Ri, self.Rf, self.Ro], dim=-1)
-        all_tilde = wx + torch.einsum("bhd,hde->bhe", state.h, R_fused)
+        wx = self.W_all(x_t).view(B, 4, H, Dh).permute(0, 2, 1, 3).reshape(B, H, 4 * Dh)
+        all_tilde = wx + torch.einsum("bhd,hde->bhe", state.h, self.R_fused)
         z_tilde, i_tilde, f_tilde, o_tilde = all_tilde.chunk(4, dim=-1)
 
         z = torch.tanh(z_tilde)
@@ -315,38 +319,51 @@ class sLSTM(nn.Module):
                 )
                 layer_input = input_size if l == 0 else hidden_size * self.num_directions
                 Dh = hidden_size // num_heads[l]
+                Hh = num_heads[l]
 
-                setattr(self, f"Wz_{d}_{l}", nn.Linear(layer_input, hidden_size, bias=bias))
-                setattr(self, f"Wi_{d}_{l}", nn.Linear(layer_input, hidden_size, bias=bias))
-                setattr(self, f"Wf_{d}_{l}", nn.Linear(layer_input, hidden_size, bias=bias))
-                setattr(self, f"Wo_{d}_{l}", nn.Linear(layer_input, hidden_size, bias=bias))
+                # Fused input projection: [Wz; Wi; Wf; Wo]
+                setattr(self, f"W_all_{d}_{l}",
+                        nn.Linear(layer_input, 4 * hidden_size, bias=bias))
 
-                setattr(self, f"Rz_{d}_{l}", nn.Parameter(torch.empty(num_heads[l], Dh, Dh)))
-                setattr(self, f"Ri_{d}_{l}", nn.Parameter(torch.empty(num_heads[l], Dh, Dh)))
-                setattr(self, f"Rf_{d}_{l}", nn.Parameter(torch.empty(num_heads[l], Dh, Dh)))
-                setattr(self, f"Ro_{d}_{l}", nn.Parameter(torch.empty(num_heads[l], Dh, Dh)))
+                # Fused recurrent weights: [Rz | Ri | Rf | Ro]
+                setattr(self, f"R_fused_{d}_{l}",
+                        nn.Parameter(torch.empty(Hh, Dh, 4 * Dh)))
 
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
         std = 1.0 / math.sqrt(self.hidden_size)
+        HS = self.hidden_size
         for d in range(self.num_directions):
-            for l in range(self.num_layers):
-                nn.init.normal_(getattr(self, f"Wz_{d}_{l}").weight, std=std)
-                nn.init.normal_(getattr(self, f"Wi_{d}_{l}").weight, std=std)
-                nn.init.normal_(getattr(self, f"Wf_{d}_{l}").weight, std=1e-2)
-                nn.init.xavier_normal_(getattr(self, f"Wo_{d}_{l}").weight)
-                for gate in ("Wz", "Wi", "Wf", "Wo"):
-                    lin = getattr(self, f"{gate}_{d}_{l}")
-                    if lin.bias is not None:
-                        nn.init.zeros_(lin.bias)
-                for gate in ("Rz", "Ri", "Rf", "Ro"):
-                    nn.init.orthogonal_(getattr(self, f"{gate}_{d}_{l}"))
+            for layer_idx in range(self.num_layers):
+                Hh = self.num_heads[layer_idx]
+                Dh = HS // Hh
+
+                # W_all weight: (4*HS, input_size), rows: [Wz | Wi | Wf | Wo]
+                W = getattr(self, f"W_all_{d}_{layer_idx}")
+                w = W.weight.data
+                nn.init.normal_(w[:HS], std=std)          # Wz
+                nn.init.normal_(w[HS:2*HS], std=std)      # Wi
+                nn.init.normal_(w[2*HS:3*HS], std=1e-2)   # Wf
+                nn.init.xavier_normal_(w[3*HS:4*HS])      # Wo
+                if W.bias is not None:
+                    nn.init.zeros_(W.bias)
+
+                # R_fused: (H, Dh, 4*Dh), columns: [Rz | Ri | Rf | Ro]
+                # orthogonal_ needs contiguous memory, so init into temp and copy
+                R = getattr(self, f"R_fused_{d}_{layer_idx}")
+                for h in range(Hh):
+                    for g in range(4):
+                        tmp = torch.empty_like(R.data[h, :, g*Dh:(g+1)*Dh])
+                        nn.init.orthogonal_(tmp)
+                        R.data[h, :, g*Dh:(g+1)*Dh] = tmp
 
     def init_state(self, batch_size: int, device=None, dtype=None):
         states = []
-        for l in range(self.num_layers):
-            Hh = self.num_heads[l]; Dh = self.hidden_size // Hh; D = self.num_directions
+        for layer_idx in range(self.num_layers):
+            Hh = self.num_heads[layer_idx]
+            Dh = self.hidden_size // Hh
+            D = self.num_directions
             s = sLSTMState(
                 c=torch.zeros(D, batch_size, Hh, Dh, device=device, dtype=dtype),
                 n=torch.zeros(D, batch_size, Hh, Dh, device=device, dtype=dtype),
@@ -359,34 +376,21 @@ class sLSTM(nn.Module):
             return result[0]
         return result
 
-    def _fuse_w_weights(self, d: int, l: int):
-        Wz = getattr(self, f"Wz_{d}_{l}"); Wi = getattr(self, f"Wi_{d}_{l}")
-        Wf = getattr(self, f"Wf_{d}_{l}"); Wo = getattr(self, f"Wo_{d}_{l}")
-        w_all = torch.cat([Wz.weight, Wi.weight, Wf.weight, Wo.weight], dim=0)
-        if Wz.bias is not None:
-            b_all = torch.cat([Wz.bias, Wi.bias, Wf.bias, Wo.bias], dim=0)
-        else:
-            b_all = None
-        return w_all, b_all
-
-    def _fuse_r_weights(self, d: int, l: int):
-        Rz = getattr(self, f"Rz_{d}_{l}"); Ri = getattr(self, f"Ri_{d}_{l}")
-        Rf = getattr(self, f"Rf_{d}_{l}"); Ro = getattr(self, f"Ro_{d}_{l}")
-        return torch.cat([Rz, Ri, Rf, Ro], dim=-1)
-
-    def _project_sequence(self, x: torch.Tensor, d: int, l: int) -> torch.Tensor:
-        Hh = self.num_heads[l]
+    def _project_sequence(self, x: torch.Tensor, d: int, layer_idx: int) -> torch.Tensor:
+        """Fused input projection for all 4 gates at once."""
+        Hh = self.num_heads[layer_idx]
+        Dh = self.hidden_size // Hh
         B, T, _ = x.shape
-        w_all, b_all = self._fuse_w_weights(d, l)
-        all_out = F.linear(x, w_all, b_all)
-        return all_out.view(B, T, Hh, -1)
+        W = getattr(self, f"W_all_{d}_{layer_idx}")
+        all_out = W(x)
+        return all_out.view(B, T, 4, Hh, Dh).permute(0, 1, 3, 2, 4).reshape(B, T, Hh, 4 * Dh)
 
     def _run_layer(
-        self, x: torch.Tensor, d: int, l: int,
+        self, x: torch.Tensor, d: int, layer_idx: int,
         c: torch.Tensor, n: torch.Tensor, m: torch.Tensor, h: torch.Tensor,
     ):
-        all_in = self._project_sequence(x, d, l)
-        R_fused = self._fuse_r_weights(d, l)
+        all_in = self._project_sequence(x, d, layer_idx)
+        R_fused = getattr(self, f"R_fused_{d}_{layer_idx}")
 
         if not self.fast_mode:
             return _slstm_scan_sequential(all_in, R_fused, c, n, m, h)
@@ -431,21 +435,23 @@ class sLSTM(nn.Module):
         layer_input = input
         final_states: List[sLSTMState] = []
 
-        for l in range(self.num_layers):
-            s_l = state[l]
+        for layer_idx in range(self.num_layers):
+            s_l = state[layer_idx]
 
             if self.num_directions == 1:
-                c_dl = s_l.c.squeeze(0); n_dl = s_l.n.squeeze(0)
-                m_dl = s_l.m.squeeze(0); h_dl = s_l.h.squeeze(0)
+                c_dl = s_l.c.squeeze(0)
+                n_dl = s_l.n.squeeze(0)
+                m_dl = s_l.m.squeeze(0)
+                h_dl = s_l.h.squeeze(0)
 
                 if self.use_checkpoint and self.training:
                     out, c_out, n_out, m_out, h_out = _torch_checkpoint(
-                        self._run_layer, layer_input, 0, l,
+                        self._run_layer, layer_input, 0, layer_idx,
                         c_dl, n_dl, m_dl, h_dl, use_reentrant=False,
                     )
                 else:
                     out, c_out, n_out, m_out, h_out = self._run_layer(
-                        layer_input, 0, l, c_dl, n_dl, m_dl, h_dl,
+                        layer_input, 0, layer_idx, c_dl, n_dl, m_dl, h_dl,
                     )
 
                 layer_output = out
@@ -455,32 +461,38 @@ class sLSTM(nn.Module):
                 ))
             else:
                 dir_outputs: List[torch.Tensor] = []
-                c_dirs: List[torch.Tensor] = []; n_dirs: List[torch.Tensor] = []
-                m_dirs: List[torch.Tensor] = []; h_dirs: List[torch.Tensor] = []
+                c_dirs: List[torch.Tensor] = []
+                n_dirs: List[torch.Tensor] = []
+                m_dirs: List[torch.Tensor] = []
+                h_dirs: List[torch.Tensor] = []
 
                 for d in range(self.num_directions):
                     if d == 1:
                         layer_input = torch.flip(layer_input, [1])
 
-                    c_dl = s_l.c[d]; n_dl = s_l.n[d]
-                    m_dl = s_l.m[d]; h_dl = s_l.h[d]
+                    c_dl = s_l.c[d]
+                    n_dl = s_l.n[d]
+                    m_dl = s_l.m[d]
+                    h_dl = s_l.h[d]
 
                     if self.use_checkpoint and self.training:
                         out, c_out, n_out, m_out, h_out = _torch_checkpoint(
-                            self._run_layer, layer_input, d, l,
+                            self._run_layer, layer_input, d, layer_idx,
                             c_dl, n_dl, m_dl, h_dl, use_reentrant=False,
                         )
                     else:
                         out, c_out, n_out, m_out, h_out = self._run_layer(
-                            layer_input, d, l, c_dl, n_dl, m_dl, h_dl,
+                            layer_input, d, layer_idx, c_dl, n_dl, m_dl, h_dl,
                         )
 
                     if d == 1:
                         out = torch.flip(out, [1])
 
                     dir_outputs.append(out)
-                    c_dirs.append(c_out); n_dirs.append(n_out)
-                    m_dirs.append(m_out); h_dirs.append(h_out)
+                    c_dirs.append(c_out)
+                    n_dirs.append(n_out)
+                    m_dirs.append(m_out)
+                    h_dirs.append(h_out)
 
                 layer_output = torch.cat(dir_outputs, dim=-1)
                 final_states.append(sLSTMState(
@@ -488,7 +500,7 @@ class sLSTM(nn.Module):
                     torch.stack(m_dirs, dim=0), torch.stack(h_dirs, dim=0),
                 ))
 
-            if l < self.num_layers - 1:
+            if layer_idx < self.num_layers - 1:
                 layer_output = self.dropout(layer_output)
             layer_input = layer_output
 

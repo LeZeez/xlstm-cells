@@ -1,6 +1,6 @@
 # xlstm-cells
 
-Pure-PyTorch mLSTM & sLSTM implementing the xLSTM paper (Beck et al., 2024) with slight similarity to `torch.nn.LSTM` structure. (optional `mlstm_kernels` support)
+Pure-PyTorch mLSTM & sLSTM implementing the xLSTM paper (Beck et al., 2024) with an `nn.LSTM`-compatible interface. Optional `mlstm_kernels` triton backend for accelerated mLSTM recurrence.
 
 ```bash
 pip install git+https://github.com/LeZeez/xlstm-cells.git
@@ -10,12 +10,12 @@ pip install git+https://github.com/LeZeez/xlstm-cells.git
 
 | Class | Signature |
 |---|---|
-| `mLSTMCell` | `mLSTMCell(input_size, hidden_size, num_heads=4)` — single-step recurrence |
-| `sLSTMCell` | `sLSTMCell(input_size, hidden_size, num_heads=4)` — single-step recurrence, block-diagonal per head |
-| `mLSTM` | `mLSTM(input_size, hidden_size, num_layers=1, num_heads=4, bidirectional=False, dropout=0, bias=True, batch_first=False)` — full sequence |
-| `sLSTM` | `sLSTM(input_size, hidden_size, num_layers=1, num_heads=4, bidirectional=False, dropout=0, bias=True, batch_first=False)` — full sequence |
-| `mLSTMBlock` | `mLSTMBlock(d_model, expand_factor=2, num_heads=4, conv_kernel=4, dropout=0, bias=True)` — [Figure 11 residual block in the original paper](https://arxiv.org/pdf/2405.04517#page=30) |
-| `sLSTMBlock` | `sLSTMBlock(d_model, expand_factor=4/3, num_heads=4, conv_kernel=4, dropout=0, bias=False)` — [Figure 10 residual block in the original paper](https://arxiv.org/pdf/2405.04517#page=29) |
+| `mLSTMCell` | `mLSTMCell(input_size, hidden_size, num_heads=4)` -- single-step recurrence |
+| `sLSTMCell` | `sLSTMCell(input_size, hidden_size, num_heads=4)` -- single-step recurrence, block-diagonal per head |
+| `mLSTM` | `mLSTM(input_size, hidden_size, num_layers=1, num_heads=4, bidirectional=False, dropout=0, bias=True, batch_first=False, pack_state=True, use_checkpoint=False, use_triton_kernels=True)` -- full sequence |
+| `sLSTM` | `sLSTM(input_size, hidden_size, num_layers=1, num_heads=4, bidirectional=False, dropout=0, bias=True, batch_first=False, pack_state=True, use_checkpoint=False, fast_mode=False, fast_chunk_size=32)` -- full sequence |
+| `mLSTMBlock` | `mLSTMBlock(d_model, expand_factor=2, num_heads=4, conv_kernel=4, dropout=0, bias=True, use_checkpoint=False, use_triton_kernels=True)` -- [Figure 11 residual block](https://arxiv.org/pdf/2405.04517#page=30) |
+| `sLSTMBlock` | `sLSTMBlock(d_model, expand_factor=4/3, num_heads=4, conv_kernel=4, dropout=0, bias=False, use_checkpoint=False, fast_mode=False, fast_chunk_size=32)` -- [Figure 10 residual block](https://arxiv.org/pdf/2405.04517#page=29) |
 | `mLSTMState` | Dataclass with `.C`, `.n`, `.m` fields |
 | `sLSTMState` | Dataclass with `.c`, `.n`, `.m`, `.h` fields |
 
@@ -23,8 +23,8 @@ pip install git+https://github.com/LeZeez/xlstm-cells.git
 
 | Function | Usage |
 |---|---|
-| `detach_states` | `detach_states(states)` — recursively detach all tensors in nested dict/list/tuple/state |
-| `zero_rows` | `zero_rows(states, mask)` — in-place zero selected batch rows across nested states (`mask` is a tensor of bools corresponding to the index of the batch you want to zero — `True` = zero)|
+| `detach_states` | `detach_states(states)` -- recursively detach all tensors in nested dict/list/tuple/state |
+| `zero_rows` | `zero_rows(states, mask)` -- in-place zero selected batch rows across nested states (`mask` is a bool tensor; `True` = zero that row) |
 
 ## Quick example
 
@@ -63,8 +63,8 @@ lstm = mLSTM(128, 256, num_layers=3, bidirectional=True, batch_first=True)
 x = torch.randn(8, 50, 128)                  # (batch, seq, input_size)
 output, states = lstm(x)                     # states = tuple of mLSTMState, one per layer
 
-# output: (8, 50, 512)  — hidden_size * 2 for bidirectional
-# states[0].C: (2, 8, 4, 64, 64)  — (D=2, B, H, Dh, Dh)
+# output: (8, 50, 512)  -- hidden_size * 2 for bidirectional
+# states[0].C: (2, 8, 4, 64, 64)  -- (D=2, B=8, H=4, Dh=64, Dh=64)
 ```
 
 ### Residual blocks (paper architecture)
@@ -87,7 +87,7 @@ for block_idx, blk in enumerate(blocks):
     s = states.get(block_idx)
     x, s = blk(x, s)
     states[block_idx] = s
-    # states[block_idx].C shape: (1, 4, H, Dh, Dh)
+    # states[block_idx].C shape: (1, B, H, Dh, Dh)
 
 states = detach_states(states)               # detach before next micro-batch
 ```
@@ -105,11 +105,74 @@ out, state = block(x)                        # state is bare mLSTMState
 zero_rows(state, torch.tensor([True, False, False, False]))
 ```
 
+## Performance
+
+### Triton kernels (mLSTM)
+
+Install `mlstm_kernels` for hardware-accelerated mLSTM recurrence on NVIDIA GPUs:
+
+```bash
+pip install mlstm_kernels
+```
+
+```python
+mLSTM(..., use_triton_kernels=True)       # default when mlstm_kernels is installed
+mLSTMBlock(..., use_triton_kernels=True)
+```
+
+Requires sequence length divisible by 64. Falls back to the native chunked-parallel scan otherwise (with a warning). To avoid the fallback, pad your sequences to a multiple of 64.
+
+### fast_mode (sLSTM)
+
+Compiles the sLSTM sequential scan with `torch.compile` over fixed-size chunks:
+
+```python
+sLSTM(..., fast_mode=True, fast_chunk_size=32)
+sLSTMBlock(..., fast_mode=True, fast_chunk_size=32)
+```
+
+Compile time is `O(fast_chunk_size)` and is not related to sequence length. Larger chunks fuse more aggressively but take longer to compile the first time. Works in both train and eval. The remainder (if `seq_len` is not a multiple of `fast_chunk_size`) runs eagerly.
+
+### Activation checkpointing
+
+Trades compute for memory -- recomputes activations during backward instead of storing them. Useful for long sequences or deep stacks:
+
+```python
+mLSTM(..., use_checkpoint=True)
+sLSTM(..., use_checkpoint=True)
+mLSTMBlock(..., use_checkpoint=True)
+sLSTMBlock(..., use_checkpoint=True)
+```
+
+Only active during `model.train()`. Combine with TBPTT for maximum memory efficiency.
+
+## TBPTT (Truncated Backpropagation Through Time)
+
+All layers and blocks accept and return state, enabling stateful training over chunks for unlimited context windows on limited hardware:
+
+```python
+from xlstm_cells import mLSTM, detach_states
+
+model = mLSTM(128, 256, batch_first=True, use_checkpoint=True)
+optimizer = torch.optim.Adam(model.parameters())
+
+states = None
+for chunk in input_sequence.split(chunk_size, dim=1):
+    output, states = model(chunk, states)
+    loss = criterion(output, target_chunk)
+    loss.backward()
+    optimizer.step()
+    optimizer.zero_grad()
+    states = detach_states(states)  # truncate gradients at chunk boundary
+```
+
+Use `zero_rows(states, mask)` to reset state for specific batch rows (e.g., when a sequence in the batch ends mid-chunk).
+
 ## States
 
 ### mLSTMState
 
-| Field | Cell shape `(B, H, Dh)` | Layer shape `(D, B, H, Dh)` |
+| Field | Cell shape | Layer shape |
 |---|---|---|
 | `C` | `(B, H, Dh, Dh)` | `(D, B, H, Dh, Dh)` |
 | `n` | `(B, H, Dh)` | `(D, B, H, Dh)` |
@@ -117,7 +180,7 @@ zero_rows(state, torch.tensor([True, False, False, False]))
 
 ### sLSTMState
 
-| Field | Cell shape `(B, H, Dh)` | Layer shape `(D, B, H, Dh)` |
+| Field | Cell shape | Layer shape |
 |---|---|---|
 | `c` | `(B, H, Dh)` | `(D, B, H, Dh)` |
 | `n` | `(B, H, Dh)` | `(D, B, H, Dh)` |
@@ -129,7 +192,7 @@ zero_rows(state, torch.tensor([True, False, False, False]))
 
 - `mLSTMCell.init_state(batch)` and `sLSTMCell.init_state(batch)` return cell shapes (no D dim).
 - `mLSTM.init_state(batch)` and `sLSTM.init_state(batch)` return a `tuple` of layer-shape states (one per layer). Set `pack_state=False` with `num_layers=1` to get a bare state.
-- Blocks use `pack_state=False` internally — `block(x)` returns a bare state.
+- Blocks use `pack_state=False` internally -- `block(x)` returns a bare state.
 - All fields are plain `torch.Tensor`. Each state has `.detach()`, `.to()`, `.clone()` methods.
 
 ## Development
@@ -143,6 +206,6 @@ pytest
 
 ## Reference
 
-Beck, M., Pöppel, K., Spanring, M., Auer, A., Prudnikova, O., Kopp, M.,
+Beck, M., Poppel, K., Spanring, M., Auer, A., Prudnikova, O., Kopp, M.,
 Klambauer, G., Brandstetter, J., & Hochreiter, S. (2024). xLSTM: Extended
 Long Short-Term Memory. *arXiv preprint arXiv:2405.04517*.

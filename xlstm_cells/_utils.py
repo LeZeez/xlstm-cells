@@ -3,16 +3,16 @@
 from __future__ import annotations
 
 import torch
-from typing import Dict, List, Tuple, Union
+from typing import Any, Dict, List, Tuple, Union
 
 
 def detach_states(
-    states: Union[Dict, List, Tuple, object]
-) -> Union[Dict, List, Tuple, object]:
+    states: Union[Dict, List, Tuple, Any]
+) -> Union[Dict, List, Tuple, Any]:
     """Recursively detach every tensor in a nested state structure.
 
     Walks dicts, lists, tuples, and state dataclasses (anything with a
-    ``.detach()`` method).  Keeps the exact same shape — dicts stay dicts,
+    ``.detach()`` method).  Keeps the exact same shape --- dicts stay dicts,
     tuples stay tuples, etc.
 
     Usage::
@@ -29,14 +29,14 @@ def detach_states(
 
 
 def zero_rows(
-    states: Union[Dict, List, Tuple, object],
+    states: Union[Dict, List, Tuple, Any],
     mask: torch.Tensor,
 ) -> None:
     """In-place zero selected batch rows across a nested state structure.
 
     ``mask`` must be a boolean tensor of shape ``(batch_size,)``.
     For every tensor field inside state dataclasses, ``tensor[:, mask] = 0``
-    is applied — this zeroes the masked rows while preserving the leading
+    is applied --- this zeroes the masked rows while preserving the leading
     dimension (num_directions) and all other dimensions.
 
     .. warning::
