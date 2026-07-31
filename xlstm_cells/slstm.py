@@ -215,10 +215,11 @@ class sLSTMCell(nn.Module):
         # R_fused is (H, Dh, 4*Dh), columns: [Rz | Ri | Rf | Ro]
         # orthogonal_ needs contiguous memory, so init into temp and copy back
         R = self.R_fused.data
-        for g in range(4):
-            tmp = torch.empty_like(R[:, :, g*Dh:(g+1)*Dh])
-            nn.init.orthogonal_(tmp)
-            R[:, :, g*Dh:(g+1)*Dh] = tmp
+        for h in range(self.num_heads):
+            for g in range(4):
+                tmp = torch.empty_like(R[h, :, g*Dh:(g+1)*Dh])
+                nn.init.orthogonal_(tmp)
+                R[h, :, g*Dh:(g+1)*Dh] = tmp
 
     def init_state(self, batch_size: int, device=None, dtype=None) -> sLSTMState:
         return sLSTMState.init(batch_size, self.num_heads, self.head_dim, device, dtype)
@@ -227,7 +228,7 @@ class sLSTMCell(nn.Module):
         B = x_t.size(0)
         H, Dh = self.num_heads, self.head_dim
 
-        wx = self.W_all(x_t).view(B, H, 4 * Dh)
+        wx = self.W_all(x_t).view(B, 4, H, Dh).permute(0, 2, 1, 3).reshape(B, H, 4 * Dh)
         all_tilde = wx + torch.einsum("bhd,hde->bhe", state.h, self.R_fused)
         z_tilde, i_tilde, f_tilde, o_tilde = all_tilde.chunk(4, dim=-1)
 
@@ -334,12 +335,12 @@ class sLSTM(nn.Module):
         std = 1.0 / math.sqrt(self.hidden_size)
         HS = self.hidden_size
         for d in range(self.num_directions):
-            for l in range(self.num_layers):
-                Hh = self.num_heads[l]
+            for layer_idx in range(self.num_layers):
+                Hh = self.num_heads[layer_idx]
                 Dh = HS // Hh
 
                 # W_all weight: (4*HS, input_size), rows: [Wz | Wi | Wf | Wo]
-                W = getattr(self, f"W_all_{d}_{l}")
+                W = getattr(self, f"W_all_{d}_{layer_idx}")
                 w = W.weight.data
                 nn.init.normal_(w[:HS], std=std)          # Wz
                 nn.init.normal_(w[HS:2*HS], std=std)      # Wi
@@ -350,16 +351,17 @@ class sLSTM(nn.Module):
 
                 # R_fused: (H, Dh, 4*Dh), columns: [Rz | Ri | Rf | Ro]
                 # orthogonal_ needs contiguous memory, so init into temp and copy
-                R = getattr(self, f"R_fused_{d}_{l}")
-                for g in range(4):
-                    tmp = torch.empty_like(R.data[:, :, g*Dh:(g+1)*Dh])
-                    nn.init.orthogonal_(tmp)
-                    R.data[:, :, g*Dh:(g+1)*Dh] = tmp
+                R = getattr(self, f"R_fused_{d}_{layer_idx}")
+                for h in range(Hh):
+                    for g in range(4):
+                        tmp = torch.empty_like(R.data[h, :, g*Dh:(g+1)*Dh])
+                        nn.init.orthogonal_(tmp)
+                        R.data[h, :, g*Dh:(g+1)*Dh] = tmp
 
     def init_state(self, batch_size: int, device=None, dtype=None):
         states = []
-        for l in range(self.num_layers):
-            Hh = self.num_heads[l]
+        for layer_idx in range(self.num_layers):
+            Hh = self.num_heads[layer_idx]
             Dh = self.hidden_size // Hh
             D = self.num_directions
             s = sLSTMState(
@@ -374,20 +376,21 @@ class sLSTM(nn.Module):
             return result[0]
         return result
 
-    def _project_sequence(self, x: torch.Tensor, d: int, l: int) -> torch.Tensor:
+    def _project_sequence(self, x: torch.Tensor, d: int, layer_idx: int) -> torch.Tensor:
         """Fused input projection for all 4 gates at once."""
-        Hh = self.num_heads[l]
+        Hh = self.num_heads[layer_idx]
+        Dh = self.hidden_size // Hh
         B, T, _ = x.shape
-        W = getattr(self, f"W_all_{d}_{l}")
+        W = getattr(self, f"W_all_{d}_{layer_idx}")
         all_out = W(x)
-        return all_out.view(B, T, Hh, -1)
+        return all_out.view(B, T, 4, Hh, Dh).permute(0, 1, 3, 2, 4).reshape(B, T, Hh, 4 * Dh)
 
     def _run_layer(
-        self, x: torch.Tensor, d: int, l: int,
+        self, x: torch.Tensor, d: int, layer_idx: int,
         c: torch.Tensor, n: torch.Tensor, m: torch.Tensor, h: torch.Tensor,
     ):
-        all_in = self._project_sequence(x, d, l)
-        R_fused = getattr(self, f"R_fused_{d}_{l}")
+        all_in = self._project_sequence(x, d, layer_idx)
+        R_fused = getattr(self, f"R_fused_{d}_{layer_idx}")
 
         if not self.fast_mode:
             return _slstm_scan_sequential(all_in, R_fused, c, n, m, h)
@@ -432,8 +435,8 @@ class sLSTM(nn.Module):
         layer_input = input
         final_states: List[sLSTMState] = []
 
-        for l in range(self.num_layers):
-            s_l = state[l]
+        for layer_idx in range(self.num_layers):
+            s_l = state[layer_idx]
 
             if self.num_directions == 1:
                 c_dl = s_l.c.squeeze(0)
@@ -443,12 +446,12 @@ class sLSTM(nn.Module):
 
                 if self.use_checkpoint and self.training:
                     out, c_out, n_out, m_out, h_out = _torch_checkpoint(
-                        self._run_layer, layer_input, 0, l,
+                        self._run_layer, layer_input, 0, layer_idx,
                         c_dl, n_dl, m_dl, h_dl, use_reentrant=False,
                     )
                 else:
                     out, c_out, n_out, m_out, h_out = self._run_layer(
-                        layer_input, 0, l, c_dl, n_dl, m_dl, h_dl,
+                        layer_input, 0, layer_idx, c_dl, n_dl, m_dl, h_dl,
                     )
 
                 layer_output = out
@@ -474,12 +477,12 @@ class sLSTM(nn.Module):
 
                     if self.use_checkpoint and self.training:
                         out, c_out, n_out, m_out, h_out = _torch_checkpoint(
-                            self._run_layer, layer_input, d, l,
+                            self._run_layer, layer_input, d, layer_idx,
                             c_dl, n_dl, m_dl, h_dl, use_reentrant=False,
                         )
                     else:
                         out, c_out, n_out, m_out, h_out = self._run_layer(
-                            layer_input, d, l, c_dl, n_dl, m_dl, h_dl,
+                            layer_input, d, layer_idx, c_dl, n_dl, m_dl, h_dl,
                         )
 
                     if d == 1:
@@ -497,7 +500,7 @@ class sLSTM(nn.Module):
                     torch.stack(m_dirs, dim=0), torch.stack(h_dirs, dim=0),
                 ))
 
-            if l < self.num_layers - 1:
+            if layer_idx < self.num_layers - 1:
                 layer_output = self.dropout(layer_output)
             layer_input = layer_output
 

@@ -494,12 +494,12 @@ class mLSTM(nn.Module):
     def reset_parameters(self) -> None:
         HS = self.hidden_size
         for d in range(self.num_directions):
-            for l in range(self.num_layers):
-                Hh = self.num_heads[l]
+            for layer_idx in range(self.num_layers):
+                Hh = self.num_heads[layer_idx]
                 std = 1.0 / math.sqrt(HS)
 
                 # W_qkvo: (4*HS, in), rows: [Wq | Wk | Wv | Wo]
-                W_qkvo = getattr(self, f"W_qkvo_{d}_{l}")
+                W_qkvo = getattr(self, f"W_qkvo_{d}_{layer_idx}")
                 w = W_qkvo.weight.data
                 nn.init.normal_(w[:HS], std=std)          # Wq
                 nn.init.normal_(w[HS:2*HS], std=std)      # Wk
@@ -509,7 +509,7 @@ class mLSTM(nn.Module):
                     nn.init.zeros_(W_qkvo.bias)
 
                 # W_if: (2*Hh, in), rows: [Wi | Wf]
-                W_if = getattr(self, f"W_if_{d}_{l}")
+                W_if = getattr(self, f"W_if_{d}_{layer_idx}")
                 wif = W_if.weight.data
                 nn.init.normal_(wif[:Hh], std=1e-2)       # Wi
                 nn.init.zeros_(wif[Hh:])                  # Wf
@@ -520,8 +520,8 @@ class mLSTM(nn.Module):
 
     def init_state(self, batch_size: int, device=None, dtype=None):
         states = []
-        for l in range(self.num_layers):
-            Hh = self.num_heads[l]
+        for layer_idx in range(self.num_layers):
+            Hh = self.num_heads[layer_idx]
             Dh = self.hidden_size // Hh
             D = self.num_directions
             s = mLSTMState(
@@ -536,14 +536,14 @@ class mLSTM(nn.Module):
         return result
 
     def _project_sequence(
-        self, x: torch.Tensor, d: int, l: int, *, apply_activations: bool = True
+        self, x: torch.Tensor, d: int, layer_idx: int, *, apply_activations: bool = True
     ) -> Tuple[torch.Tensor, ...]:
         """Project input sequence through fused weight matrices.
 
         Args:
             x: (B, T, in_features)
             d: direction index
-            l: layer index
+            layer_idx: layer index
             apply_activations: if True, apply sigmoid to output gate and
                 logsigmoid to forget gate.  Set False for triton backend
                 which applies its own activations.
@@ -551,12 +551,12 @@ class mLSTM(nn.Module):
         Returns:
             q, k, v, o, i_tilde, f_or_logf
         """
-        Hh = self.num_heads[l]
+        Hh = self.num_heads[layer_idx]
         Dh = self.hidden_size // Hh
         B, T, _ = x.shape
         sf = math.sqrt(Dh)
 
-        W_qkvo = getattr(self, f"W_qkvo_{d}_{l}")
+        W_qkvo = getattr(self, f"W_qkvo_{d}_{layer_idx}")
         qkvo = W_qkvo(x)
         q, k, v, o_raw = qkvo.view(B, T, 4, Hh, Dh).unbind(2)
         k = k / sf
@@ -565,7 +565,7 @@ class mLSTM(nn.Module):
         else:
             o = o_raw
 
-        W_if = getattr(self, f"W_if_{d}_{l}")
+        W_if = getattr(self, f"W_if_{d}_{layer_idx}")
         iff = W_if(x)
         i_tilde, f_raw = iff.view(B, T, 2, Hh).unbind(2)
         if apply_activations:
@@ -579,7 +579,7 @@ class mLSTM(nn.Module):
         self,
         x: torch.Tensor,
         d: int,
-        l: int,
+        layer_idx: int,
         C: torch.Tensor,
         n: torch.Tensor,
         m: torch.Tensor,
@@ -587,7 +587,7 @@ class mLSTM(nn.Module):
         if (self._use_triton_kernels
                 and x.size(1) % self._chunk_size == 0
                 and not torch._dynamo.is_compiling()):
-            return self._run_layer_kernels(x, d, l, C, n, m)
+            return self._run_layer_kernels(x, d, layer_idx, C, n, m)
 
         # Warn once if triton was requested but can't be used
         if self._use_triton_kernels and x.size(1) % self._chunk_size != 0:
@@ -602,19 +602,19 @@ class mLSTM(nn.Module):
                 )
                 _triton_fallback_warned = True
 
-        return self._run_layer_native(x, d, l, C, n, m)
+        return self._run_layer_native(x, d, layer_idx, C, n, m)
 
     def _run_layer_native(
         self,
         x: torch.Tensor,
         d: int,
-        l: int,
+        layer_idx: int,
         C: torch.Tensor,
         n: torch.Tensor,
         m: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         q, k, v, o, i_tilde, log_f = self._project_sequence(
-            x, d, l, apply_activations=True,
+            x, d, layer_idx, apply_activations=True,
         )
         return _mlstm_recurrent_scan_parallel_chunked(
             q, k, v, o, i_tilde, log_f, C, n, m,
@@ -625,17 +625,17 @@ class mLSTM(nn.Module):
         self,
         x: torch.Tensor,
         d: int,
-        l: int,
+        layer_idx: int,
         C: torch.Tensor,
         n: torch.Tensor,
         m: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        Hh = self.num_heads[l]
+        Hh = self.num_heads[layer_idx]
         Dh = self.hidden_size // Hh
         B, T, _ = x.shape
 
         q, k, v, o_raw, i_tilde, f_tilde = self._project_sequence(
-            x, d, l, apply_activations=False,
+            x, d, layer_idx, apply_activations=False,
         )
 
         # Permute (B,T,H,Dh) -> (B,H,T,Dh) for triton kernels.
@@ -684,8 +684,8 @@ class mLSTM(nn.Module):
         layer_input = input
         final_states: List[mLSTMState] = []
 
-        for l in range(self.num_layers):
-            s_l = state[l]
+        for layer_idx in range(self.num_layers):
+            s_l = state[layer_idx]
 
             if self.num_directions == 1:
                 C_dl = s_l.C.squeeze(0)
@@ -694,12 +694,12 @@ class mLSTM(nn.Module):
 
                 if self.use_checkpoint and self.training:
                     out, C_out, n_out, m_out = _torch_checkpoint(
-                        self._run_layer, layer_input, 0, l, C_dl, n_dl, m_dl,
+                        self._run_layer, layer_input, 0, layer_idx, C_dl, n_dl, m_dl,
                         use_reentrant=False,
                     )
                 else:
                     out, C_out, n_out, m_out = self._run_layer(
-                        layer_input, 0, l, C_dl, n_dl, m_dl,
+                        layer_input, 0, layer_idx, C_dl, n_dl, m_dl,
                     )
 
                 layer_output = out
@@ -722,12 +722,12 @@ class mLSTM(nn.Module):
 
                     if self.use_checkpoint and self.training:
                         out, C_out, n_out, m_out = _torch_checkpoint(
-                            self._run_layer, layer_input, d, l, C_dl, n_dl, m_dl,
+                            self._run_layer, layer_input, d, layer_idx, C_dl, n_dl, m_dl,
                             use_reentrant=False,
                         )
                     else:
                         out, C_out, n_out, m_out = self._run_layer(
-                            layer_input, d, l, C_dl, n_dl, m_dl,
+                            layer_input, d, layer_idx, C_dl, n_dl, m_dl,
                         )
 
                     if d == 1:
@@ -745,7 +745,7 @@ class mLSTM(nn.Module):
                     torch.stack(m_dirs, dim=0),
                 ))
 
-            if l < self.num_layers - 1:
+            if layer_idx < self.num_layers - 1:
                 layer_output = self.dropout(layer_output)
 
             layer_input = layer_output

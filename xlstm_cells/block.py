@@ -245,8 +245,13 @@ class sLSTMBlock(nn.Module):
 
     def reset_parameters(self):
         """Re-initialize learnable parameters of this block."""
-        # Delegate to submodules that have their own reset_parameters
+        self.ln.reset_parameters()
+        if self.conv is not None:
+            self.conv.reset_parameters()
         self.lstm.reset_parameters()
+        self.gn.reset_parameters()
+        self.fused_proj.reset_parameters()
+        self.down_proj.reset_parameters()
 
     def forward(
         self,
