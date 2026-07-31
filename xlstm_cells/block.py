@@ -70,6 +70,8 @@ class mLSTMBlock(nn.Module):
         conv_kernel:    causal conv1d kernel size (paper uses 4, set 0 to disable)
         dropout:        dropout on output
         bias:           whether linear layers use bias
+        use_checkpoint:     activation checkpointing for mLSTM recurrence
+        use_triton_kernels: use mlstm_kernels triton backend if available
     """
 
     def __init__(
@@ -183,6 +185,9 @@ class sLSTMBlock(nn.Module):
         conv_kernel:    causal conv1d kernel size (paper uses 4, set 0 to disable)
         dropout:        dropout on output
         bias:           whether linear layers use bias
+        use_checkpoint:   activation checkpointing for sLSTM recurrence
+        fast_mode:        compile sequential scan with torch.compile
+        fast_chunk_size:  chunk size for compiled scan (default 32)
     """
 
     def __init__(
@@ -235,6 +240,13 @@ class sLSTMBlock(nn.Module):
         self.fused_proj = nn.Linear(d_model, 2 * expanded, bias=bias)
         self.down_proj = nn.Linear(expanded, d_model, bias=bias)
         self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
+
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        """Re-initialize learnable parameters of this block."""
+        # Delegate to submodules that have their own reset_parameters
+        self.lstm.reset_parameters()
 
     def forward(
         self,
