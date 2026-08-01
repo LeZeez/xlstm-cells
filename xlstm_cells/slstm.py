@@ -184,7 +184,8 @@ class sLSTMCell(nn.Module):
     Weights are stored as fused parameters to avoid torch.cat on every step.
     """
 
-    def __init__(self, input_size: int, hidden_size: int, num_heads: int = 4):
+    def __init__(self, input_size: int, hidden_size: int, num_heads: int = 4,
+                 bias: bool = True):
         super().__init__()
         assert hidden_size % num_heads == 0
         self.input_size = input_size
@@ -194,7 +195,7 @@ class sLSTMCell(nn.Module):
         Dh = self.head_dim
 
         # Fused input projection: [Wz; Wi; Wf; Wo] as one linear
-        self.W_all = nn.Linear(input_size, 4 * hidden_size, bias=False)
+        self.W_all = nn.Linear(input_size, 4 * hidden_size, bias=bias)
 
         # Fused recurrent weights: [Rz | Ri | Rf | Ro] concatenated on last dim
         self.R_fused = nn.Parameter(torch.empty(num_heads, Dh, 4 * Dh))
@@ -212,6 +213,10 @@ class sLSTMCell(nn.Module):
         nn.init.normal_(w[HS:2*HS], std=std)      # Wi
         nn.init.normal_(w[2*HS:3*HS], std=1e-2)   # Wf
         nn.init.xavier_normal_(w[3*HS:4*HS])      # Wo
+        if self.W_all.bias is not None:
+            nn.init.zeros_(self.W_all.bias)
+            # Forget gate is the 3rd chunk [Wz | Wi | Wf | Wo]
+            self.W_all.bias.data[2*HS:3*HS].fill_(3.0)
         # R_fused is (H, Dh, 4*Dh), columns: [Rz | Ri | Rf | Ro]
         # orthogonal_ needs contiguous memory, so init into temp and copy back
         R = self.R_fused.data
@@ -348,6 +353,8 @@ class sLSTM(nn.Module):
                 nn.init.xavier_normal_(w[3*HS:4*HS])      # Wo
                 if W.bias is not None:
                     nn.init.zeros_(W.bias)
+                    # Forget gate is the 3rd chunk [Wz | Wi | Wf | Wo]
+                    W.bias.data[2*HS:3*HS].fill_(3.0)
 
                 # R_fused: (H, Dh, 4*Dh), columns: [Rz | Ri | Rf | Ro]
                 # orthogonal_ needs contiguous memory, so init into temp and copy

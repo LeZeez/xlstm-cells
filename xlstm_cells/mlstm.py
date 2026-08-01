@@ -327,7 +327,8 @@ class mLSTMCell(nn.Module):
     Weights are stored as fused parameters to avoid torch.cat on every step.
     """
 
-    def __init__(self, input_size: int, hidden_size: int, num_heads: int = 4):
+    def __init__(self, input_size: int, hidden_size: int, num_heads: int = 4,
+                 bias: bool = True):
         super().__init__()
         assert hidden_size % num_heads == 0, "hidden_size must be divisible by num_heads"
         self.input_size = input_size
@@ -336,9 +337,9 @@ class mLSTMCell(nn.Module):
         self.head_dim = hidden_size // num_heads
 
         # Fused: [Wq; Wk; Wv; Wo] as one linear
-        self.W_qkvo = nn.Linear(input_size, 4 * hidden_size, bias=False)
+        self.W_qkvo = nn.Linear(input_size, 4 * hidden_size, bias=bias)
         # Fused: [Wi; Wf] as one linear
-        self.W_if = nn.Linear(input_size, 2 * num_heads, bias=False)
+        self.W_if = nn.Linear(input_size, 2 * num_heads, bias=bias)
 
         self._sf = math.sqrt(self.head_dim)
         self.reset_parameters()
@@ -353,10 +354,16 @@ class mLSTMCell(nn.Module):
         nn.init.normal_(w[HS:2*HS], std=std)      # Wk
         nn.init.normal_(w[2*HS:3*HS], std=std)    # Wv
         nn.init.xavier_normal_(w[3*HS:4*HS])      # Wo
+        if self.W_qkvo.bias is not None:
+            nn.init.zeros_(self.W_qkvo.bias)
         # W_if: (2*NH, input_size), rows: [Wi | Wf]
         wif = self.W_if.weight.data
         nn.init.normal_(wif[:NH], std=1e-2)       # Wi
         nn.init.zeros_(wif[NH:])                  # Wf
+        if self.W_if.bias is not None:
+            nn.init.zeros_(self.W_if.bias)
+            # Forget gate is the 2nd chunk [Wi | Wf]
+            self.W_if.bias.data[NH:].fill_(3.0)
 
     def init_state(self, batch_size: int, device=None, dtype=None) -> mLSTMState:
         return mLSTMState.init(batch_size, self.num_heads, self.head_dim, device, dtype)
