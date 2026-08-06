@@ -492,6 +492,12 @@ class mLSTM(nn.Module):
         self._has_bias = bias
 
         self._use_triton_kernels = use_triton_kernels and _HAS_MLSTM_KERNELS
+        if (
+            isinstance(chunk_size, bool)
+            or not isinstance(chunk_size, int)
+            or chunk_size <= 0
+        ):
+            raise ValueError("chunk_size must be a positive integer")
         self._chunk_size = chunk_size
         self._chunkwise_kernel = chunkwise_kernel
         self._mlstm_backend = None
