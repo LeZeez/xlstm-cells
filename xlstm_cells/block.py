@@ -18,7 +18,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional, Tuple
 
-from .mlstm import mLSTM, mLSTMState
+from .mlstm import _MLSTM_CHUNK_SIZE, mLSTM, mLSTMState
 from .slstm import sLSTM, sLSTMState
 
 _GN_EPS = 1e-5
@@ -72,6 +72,18 @@ class mLSTMBlock(nn.Module):
         bias:           whether linear layers use bias
         use_checkpoint:     activation checkpointing for mLSTM recurrence
         use_triton_kernels: use mlstm_kernels triton backend if available
+        chunkwise_kernel:   triton chunkwise kernel (both exp-gate):
+                            "limit_chunk" (default), "xl_chunk"
+        chunk_size:         chunk size for the chunkwise kernel (default 64)
+
+    .. hint::
+        **Triton kernels vs. activation checkpointing**
+        The triton backend computes the mLSTM recurrence chunk-wise and keeps
+        peak activation memory far below the native chunked-parallel scan.
+        ``use_checkpoint=True`` still cuts retained activation memory by
+        roughly half at the cost of recomputing the sequence during the
+        backward pass.  Prefer checkpointing when VRAM-bound, omit it when
+        compute-bound.
     """
 
     def __init__(
@@ -84,6 +96,8 @@ class mLSTMBlock(nn.Module):
         bias: bool = True,
         use_checkpoint: bool = False,
         use_triton_kernels: bool = True,
+        chunkwise_kernel: str = "limit_chunk",
+        chunk_size: int = _MLSTM_CHUNK_SIZE,
     ):
         super().__init__()
         expanded = d_model * expand_factor
@@ -118,6 +132,8 @@ class mLSTMBlock(nn.Module):
             pack_state=False,
             use_checkpoint=use_checkpoint,
             use_triton_kernels=use_triton_kernels,
+            chunkwise_kernel=chunkwise_kernel,
+            chunk_size=chunk_size,
         )
 
         self.gn = nn.GroupNorm(num_heads, expanded)

@@ -34,6 +34,16 @@ except ImportError:
 _EPS = 1e-6
 _MLSTM_CHUNK_SIZE = 64
 
+# Accessible short names for the mlstm_kernels chunkwise triton kernels.
+# The shared "chunkwise--triton" prefix is omitted; see mLSTM.chunkwise_kernel.
+# Both kernels use exponential input gating (i_prime = exp(i_tilde - m)) with a
+# running log-space max state m for numerical stability.  When triton is
+# unavailable the native chunked-parallel scan is used — same exp-gate math.
+_TRITON_CHUNKWISE_KERNELS = {
+    "limit_chunk": "chunkwise--triton_limit_chunk",
+    "xl_chunk": "chunkwise--triton_xl_chunk",
+}
+
 # Track whether we've already warned about triton fallback
 _triton_fallback_warned = False
 
@@ -427,7 +437,31 @@ class mLSTM(nn.Module):
                              the recurrent scan (default True if available).
                              Falls back to chunked PyTorch parallel scan if
                              unavailable or if sequence length is not a multiple
-                             of chunk_size (64).
+                             of chunk_size (default 64).
+        chunkwise_kernel:  triton chunkwise kernel for the recurrent scan.
+                             Both use exponential input gating
+                             (i_prime = exp(i_tilde - m)) with a running
+                             log-space max state ``m`` for numerical stability.
+                             When triton is unavailable (missing mlstm_kernels,
+                             CPU input, non-divisible sequence length, or
+                             torch.compile) the native chunked-parallel scan is
+                             used — same exp-gate math, no semantic change.
+                               "limit_chunk"  standard TFLA chunkwise kernel
+                                              (default)
+                               "xl_chunk"     TFLA kernel optimized for larger
+                                              chunk sizes
+        chunk_size:      chunk size for the chunkwise kernel (default 64; must
+                         divide the sequence length when triton is used)
+
+    .. hint::
+        **Triton kernels vs. activation checkpointing**
+        The triton backend computes the recurrence chunk-wise and keeps peak
+        activation memory far below the native chunked-parallel scan.  On top
+        of that, ``use_checkpoint=True`` still cuts retained activation memory
+        by roughly half (measured ~45% on mLSTMBlock at B=1, T=1024,
+        expanded=2048) at the cost of recomputing the sequence during the
+        backward pass.  Prefer checkpointing when VRAM-bound, omit it when
+        compute-bound.
     """
 
     def __init__(
@@ -443,6 +477,8 @@ class mLSTM(nn.Module):
         pack_state: bool = True,
         use_checkpoint: bool = False,
         use_triton_kernels: bool = True,
+        chunkwise_kernel: str = "limit_chunk",
+        chunk_size: int = _MLSTM_CHUNK_SIZE,
     ):
         super().__init__()
 
@@ -463,8 +499,33 @@ class mLSTM(nn.Module):
         self._has_bias = bias
 
         self._use_triton_kernels = use_triton_kernels and _HAS_MLSTM_KERNELS
-        self._chunk_size = _MLSTM_CHUNK_SIZE
+        if (
+            isinstance(chunk_size, bool)
+            or not isinstance(chunk_size, int)
+            or chunk_size <= 0
+        ):
+            raise ValueError("chunk_size must be a positive integer")
+        self._chunk_size = chunk_size
+        self._chunkwise_kernel = chunkwise_kernel
         self._mlstm_backend = None
+
+        if chunkwise_kernel not in _TRITON_CHUNKWISE_KERNELS:
+            raise ValueError(
+                f"mLSTM: unknown chunkwise_kernel {chunkwise_kernel!r}, "
+                f"choose one of {sorted(_TRITON_CHUNKWISE_KERNELS)}."
+            )
+
+        if use_triton_kernels and not _HAS_MLSTM_KERNELS:
+            global _triton_fallback_warned
+            if not _triton_fallback_warned:
+                warnings.warn(
+                    "mLSTM: use_triton_kernels=True but 'mlstm_kernels' is not "
+                    "installed. Falling back to the native chunked-parallel scan, "
+                    "which is significantly slower. Install with "
+                    "'pip install mlstm_kernels' (requires a CUDA GPU).",
+                    stacklevel=3,
+                )
+                _triton_fallback_warned = True
 
         for d in range(self.num_directions):
             for l in range(num_layers):
@@ -488,7 +549,7 @@ class mLSTM(nn.Module):
 
     def _init_triton_backend(self):
         config = mLSTMBackendConfig(
-            chunkwise_kernel="chunkwise--triton_limit_chunk",
+            chunkwise_kernel=_TRITON_CHUNKWISE_KERNELS[self._chunkwise_kernel],
             sequence_kernel="native_sequence__triton",
             step_kernel="triton",
             mode="train",
@@ -592,21 +653,41 @@ class mLSTM(nn.Module):
         m: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         if (self._use_triton_kernels
+                and x.is_cuda
                 and x.size(1) % self._chunk_size == 0
                 and not torch._dynamo.is_compiling()):
             return self._run_layer_kernels(x, d, layer_idx, C, n, m)
 
         # Warn once if triton was requested but can't be used
-        if self._use_triton_kernels and x.size(1) % self._chunk_size != 0:
+        if self._use_triton_kernels:
             global _triton_fallback_warned
             if not _triton_fallback_warned:
-                warnings.warn(
-                    f"mLSTM: triton kernels requested but seq_len={x.size(1)} "
-                    f"is not divisible by chunk_size={self._chunk_size}. "
-                    f"Falling back to native chunked-parallel scan. "
-                    f"Pad to a multiple of {self._chunk_size} for triton acceleration.",
-                    stacklevel=3,
-                )
+                if not x.is_cuda:
+                    msg = (
+                        "mLSTM: triton kernels require CUDA tensors but input "
+                        "is on CPU. Falling back to native chunked-parallel scan."
+                    )
+                elif x.size(1) % self._chunk_size != 0:
+                    msg = (
+                        f"mLSTM: triton kernels requested but seq_len={x.size(1)} "
+                        f"is not divisible by chunk_size={self._chunk_size}. "
+                        f"Falling back to native chunked-parallel scan. "
+                        f"Pad to a multiple of {self._chunk_size} for triton acceleration."
+                    )
+                elif torch._dynamo.is_compiling():
+                    msg = (
+                        "mLSTM: triton kernels disabled under torch.compile tracing "
+                        "(mlstm_kernels' triton_limit_chunk kernels crash inside "
+                        "Inductor). Falling back to native chunked-parallel scan, "
+                        "which is significantly slower. Do NOT wrap the model in "
+                        "torch.compile if you want kernel acceleration."
+                    )
+                else:
+                    msg = (
+                        "mLSTM: triton kernels requested but unavailable. "
+                        "Falling back to native chunked-parallel scan."
+                    )
+                warnings.warn(msg, stacklevel=3)
                 _triton_fallback_warned = True
 
         return self._run_layer_native(x, d, layer_idx, C, n, m)
