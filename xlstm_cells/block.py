@@ -72,9 +72,8 @@ class mLSTMBlock(nn.Module):
         bias:           whether linear layers use bias
         use_checkpoint:     activation checkpointing for mLSTM recurrence
         use_triton_kernels: use mlstm_kernels triton backend if available
-        chunkwise_kernel:   chunkwise triton kernel, "chunkwise--triton" prefix
-                            omitted: "limit_chunk" (default), "xl_chunk",
-                            "xl_chunk_siging"
+        chunkwise_kernel:   triton chunkwise kernel (both exp-gate):
+                            "limit_chunk" (default), "xl_chunk"
         chunk_size:         chunk size for the chunkwise kernel (default 64)
 
     .. hint::

@@ -12,9 +12,9 @@ pip install git+https://github.com/LeZeez/xlstm-cells.git
 |---|---|
 | `mLSTMCell` | `mLSTMCell(input_size, hidden_size, num_heads=4)` -- single-step recurrence |
 | `sLSTMCell` | `sLSTMCell(input_size, hidden_size, num_heads=4)` -- single-step recurrence, block-diagonal per head |
-| `mLSTM` | `mLSTM(input_size, hidden_size, num_layers=1, num_heads=4, bidirectional=False, dropout=0, bias=True, batch_first=False, pack_state=True, use_checkpoint=False, use_triton_kernels=True)` -- full sequence |
+| `mLSTM` | `mLSTM(input_size, hidden_size, num_layers=1, num_heads=4, bidirectional=False, dropout=0, bias=True, batch_first=False, pack_state=True, use_checkpoint=False, use_triton_kernels=True, chunkwise_kernel="limit_chunk", chunk_size=64)` -- full sequence |
 | `sLSTM` | `sLSTM(input_size, hidden_size, num_layers=1, num_heads=4, bidirectional=False, dropout=0, bias=True, batch_first=False, pack_state=True, use_checkpoint=False, fast_mode=False, fast_chunk_size=32)` -- full sequence |
-| `mLSTMBlock` | `mLSTMBlock(d_model, expand_factor=2, num_heads=4, conv_kernel=4, dropout=0, bias=True, use_checkpoint=False, use_triton_kernels=True)` -- [Figure 11 residual block](https://arxiv.org/pdf/2405.04517#page=30) |
+| `mLSTMBlock` | `mLSTMBlock(d_model, expand_factor=2, num_heads=4, conv_kernel=4, dropout=0, bias=True, use_checkpoint=False, use_triton_kernels=True, chunkwise_kernel="limit_chunk", chunk_size=64)` -- [Figure 11 residual block](https://arxiv.org/pdf/2405.04517#page=30) |
 | `sLSTMBlock` | `sLSTMBlock(d_model, expand_factor=4/3, num_heads=4, conv_kernel=4, dropout=0, bias=False, use_checkpoint=False, fast_mode=False, fast_chunk_size=32)` -- [Figure 10 residual block](https://arxiv.org/pdf/2405.04517#page=29) |
 | `mLSTMState` | Dataclass with `.C`, `.n`, `.m` fields |
 | `sLSTMState` | Dataclass with `.c`, `.n`, `.m`, `.h` fields |
@@ -203,6 +203,51 @@ cd xlstm-cells
 pip install -e ".[dev]"
 pytest
 ```
+
+## `mlstm_kernels` Support
+
+`xlstm-cells` optionally integrates with the [`mlstm_kernels`](https://github.com/NX-AI/mlstm_kernels) package for hardware-accelerated mLSTM recurrence via Triton kernels on NVIDIA GPUs.
+
+```bash
+pip install mlstm_kernels
+```
+
+### Supported kernels
+
+We support two chunkwise kernels from `mlstm_kernels`. Both use **exponential input gating** (`i_prime = exp(i_tilde - m)`) with a running log-space max state `m` for numerical stability. When triton is unavailable (missing package, CPU input, non-divisible sequence length, or `torch.compile`), the native chunked-parallel scan is used automatically — same exp-gate math, no semantic change.
+
+| Short name | Full internal name | Description |
+|---|---|---|
+| `limit_chunk` | `chunkwise--triton_limit_chunk` | Standard TFLA chunkwise kernel. Default. |
+| `xl_chunk` | `chunkwise--triton_xl_chunk` | TFLA kernel optimized for larger chunk sizes. |
+
+Select a kernel and chunk size when creating an `mLSTM` or `mLSTMBlock`:
+
+```python
+from xlstm_cells import mLSTM, mLSTMBlock
+
+# Default: limit_chunk, chunk_size=64
+layer = mLSTM(128, 256, use_triton_kernels=True)
+
+# xl_chunk with larger chunks
+layer = mLSTM(128, 256, use_triton_kernels=True,
+              chunkwise_kernel="xl_chunk", chunk_size=128)
+
+# Same args on blocks
+block = mLSTMBlock(512, use_triton_kernels=True,
+                   chunkwise_kernel="xl_chunk", chunk_size=128)
+```
+
+### Requirements
+
+- NVIDIA GPU with CUDA support
+- `mlstm_kernels` installed (`pip install mlstm_kernels`)
+- Sequence length must be divisible by `chunk_size` (default 64) for triton acceleration
+- `torch.compile` is **not** compatible with `mlstm_kernels` (crashes inside Inductor); the native scan is used as fallback
+
+### Unsupported kernels
+
+The `mlstm_kernels` package also ships `xl_chunk_siging` (sigmoid input gating from the [TFLA paper](https://arxiv.org/abs/2503.14376)). We do not support it because it uses fundamentally different gate math (`sigmoid` vs `exp`) with no semantically equivalent native fallback, no inference/step kernels, and NX-AI does not use it in production.
 
 ## Reference
 

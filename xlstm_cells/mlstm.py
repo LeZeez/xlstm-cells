@@ -36,10 +36,12 @@ _MLSTM_CHUNK_SIZE = 64
 
 # Accessible short names for the mlstm_kernels chunkwise triton kernels.
 # The shared "chunkwise--triton" prefix is omitted; see mLSTM.chunkwise_kernel.
+# Both kernels use exponential input gating (i_prime = exp(i_tilde - m)) with a
+# running log-space max state m for numerical stability.  When triton is
+# unavailable the native chunked-parallel scan is used — same exp-gate math.
 _TRITON_CHUNKWISE_KERNELS = {
     "limit_chunk": "chunkwise--triton_limit_chunk",
     "xl_chunk": "chunkwise--triton_xl_chunk",
-    "xl_chunk_siging": "chunkwise--triton_xl_chunk_siging",
 }
 
 # Track whether we've already warned about triton fallback
@@ -436,13 +438,18 @@ class mLSTM(nn.Module):
                              Falls back to chunked PyTorch parallel scan if
                              unavailable or if sequence length is not a multiple
                              of chunk_size (default 64).
-        chunkwise_kernel:  chunkwise triton kernel for the recurrent scan,
-                             given as a short name with the shared
-                             "chunkwise--triton" prefix omitted:
-                               "limit_chunk"      standard chunkwise kernel (default)
-                               "xl_chunk"         extra-large chunk sizes
-                               "xl_chunk_siging"  xl_chunk with the input-gate
-                                                  sigmoid fused into the kernel
+        chunkwise_kernel:  triton chunkwise kernel for the recurrent scan.
+                             Both use exponential input gating
+                             (i_prime = exp(i_tilde - m)) with a running
+                             log-space max state ``m`` for numerical stability.
+                             When triton is unavailable (missing mlstm_kernels,
+                             CPU input, non-divisible sequence length, or
+                             torch.compile) the native chunked-parallel scan is
+                             used — same exp-gate math, no semantic change.
+                               "limit_chunk"  standard TFLA chunkwise kernel
+                                              (default)
+                               "xl_chunk"     TFLA kernel optimized for larger
+                                              chunk sizes
         chunk_size:      chunk size for the chunkwise kernel (default 64; must
                          divide the sequence length when triton is used)
 
@@ -646,6 +653,7 @@ class mLSTM(nn.Module):
         m: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         if (self._use_triton_kernels
+                and x.is_cuda
                 and x.size(1) % self._chunk_size == 0
                 and not torch._dynamo.is_compiling()):
             return self._run_layer_kernels(x, d, layer_idx, C, n, m)
@@ -654,7 +662,12 @@ class mLSTM(nn.Module):
         if self._use_triton_kernels:
             global _triton_fallback_warned
             if not _triton_fallback_warned:
-                if x.size(1) % self._chunk_size != 0:
+                if not x.is_cuda:
+                    msg = (
+                        "mLSTM: triton kernels require CUDA tensors but input "
+                        "is on CPU. Falling back to native chunked-parallel scan."
+                    )
+                elif x.size(1) % self._chunk_size != 0:
                     msg = (
                         f"mLSTM: triton kernels requested but seq_len={x.size(1)} "
                         f"is not divisible by chunk_size={self._chunk_size}. "
