@@ -437,7 +437,7 @@ class mLSTM(nn.Module):
                              the recurrent scan (default True if available).
                              Falls back to chunked PyTorch parallel scan if
                              unavailable or if sequence length is not a multiple
-                             of chunk_size (default 64).
+                             of chunk_size (default 128).
         chunkwise_kernel:  triton chunkwise kernel for the recurrent scan.
                              Both use exponential input gating
                              (i_prime = exp(i_tilde - m)) with a running
