@@ -66,15 +66,18 @@ class mLSTMBlock(nn.Module):
     Args:
         d_model:        input & output feature dimension
         expand_factor:  up-projection multiplier (paper uses 2)
-        num_heads:      number of mLSTM heads
+        num_heads:      number of mLSTM heads (default 16; higher head counts
+                        are more memory-efficient: the C state scales as
+                        num_heads * head_dim^2, so more heads with smaller
+                        head_dim = less total memory)
         conv_kernel:    causal conv1d kernel size (paper uses 4, set 0 to disable)
         dropout:        dropout on output
         bias:           whether linear layers use bias
         use_checkpoint:     activation checkpointing for mLSTM recurrence
         use_triton_kernels: use mlstm_kernels triton backend if available
         chunkwise_kernel:   triton chunkwise kernel (both exp-gate):
-                            "limit_chunk" (default), "xl_chunk"
-        chunk_size:         chunk size for the chunkwise kernel (default 64)
+                            "xl_chunk" (default), "limit_chunk"
+        chunk_size:         chunk size for the chunkwise kernel (default 128)
 
     .. hint::
         **Triton kernels vs. activation checkpointing**
@@ -90,13 +93,13 @@ class mLSTMBlock(nn.Module):
         self,
         d_model: int,
         expand_factor: int = 2,
-        num_heads: int = 4,
+        num_heads: int = 16,
         conv_kernel: int = 4,
         dropout: float = 0.0,
         bias: bool = True,
         use_checkpoint: bool = False,
         use_triton_kernels: bool = True,
-        chunkwise_kernel: str = "limit_chunk",
+        chunkwise_kernel: str = "xl_chunk",
         chunk_size: int = _MLSTM_CHUNK_SIZE,
     ):
         super().__init__()

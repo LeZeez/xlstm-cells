@@ -32,7 +32,7 @@ except ImportError:
     _HAS_MLSTM_KERNELS = False
 
 _EPS = 1e-6
-_MLSTM_CHUNK_SIZE = 64
+_MLSTM_CHUNK_SIZE = 128
 
 # Accessible short names for the mlstm_kernels chunkwise triton kernels.
 # The shared "chunkwise--triton" prefix is omitted; see mLSTM.chunkwise_kernel.
@@ -437,7 +437,7 @@ class mLSTM(nn.Module):
                              the recurrent scan (default True if available).
                              Falls back to chunked PyTorch parallel scan if
                              unavailable or if sequence length is not a multiple
-                             of chunk_size (default 64).
+                             of chunk_size (default 128).
         chunkwise_kernel:  triton chunkwise kernel for the recurrent scan.
                              Both use exponential input gating
                              (i_prime = exp(i_tilde - m)) with a running
@@ -446,11 +446,11 @@ class mLSTM(nn.Module):
                              CPU input, non-divisible sequence length, or
                              torch.compile) the native chunked-parallel scan is
                              used — same exp-gate math, no semantic change.
-                               "limit_chunk"  standard TFLA chunkwise kernel
-                                              (default)
                                "xl_chunk"     TFLA kernel optimized for larger
-                                              chunk sizes
-        chunk_size:      chunk size for the chunkwise kernel (default 64; must
+                                              chunk sizes and lower backward
+                                              memory usage (default)
+                               "limit_chunk"  standard TFLA chunkwise kernel
+        chunk_size:      chunk size for the chunkwise kernel (default 128; must
                          divide the sequence length when triton is used)
 
     .. hint::
@@ -477,7 +477,7 @@ class mLSTM(nn.Module):
         pack_state: bool = True,
         use_checkpoint: bool = False,
         use_triton_kernels: bool = True,
-        chunkwise_kernel: str = "limit_chunk",
+        chunkwise_kernel: str = "xl_chunk",
         chunk_size: int = _MLSTM_CHUNK_SIZE,
     ):
         super().__init__()
@@ -720,28 +720,37 @@ class mLSTM(nn.Module):
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         Hh = self.num_heads[layer_idx]
         Dh = self.hidden_size // Hh
+        sf = math.sqrt(Dh)
         B, T, _ = x.shape
 
         q, k, v, o_raw, i_tilde, f_tilde = self._project_sequence(
             x, d, layer_idx, apply_activations=False,
         )
 
+        # The triton kernels apply qk_scale = 1/sqrt(Dh) internally and store
+        # the C/n states with UNSCALED keys (reference xLSTM math).  The native
+        # scan pre-scales k instead.  Undo the pre-scale here and convert the
+        # kernel's states back to the native convention at the boundary so that
+        # both paths produce identical outputs and interchangeable states
+        # (TBPTT can mix kernel and native segments freely).
+        k = k * sf
+
         # Permute (B,T,H,Dh) -> (B,H,T,Dh) for triton kernels.
-        # Single permute+contiguous for q/k/v instead of separate ones.
-        qkv = torch.stack([q, k, v], dim=0)              # (3, B, T, H, Dh)
-        qkv = qkv.permute(0, 1, 3, 2, 4).contiguous()    # (3, B, H, T, Dh)
-        q_k, k_k, v_k = qkv.unbind(0)
+        # Individual permute+contiguous avoids the intermediate stacked tensor
+        # that torch.stack([q,k,v]).permute().contiguous() would create.
+        q_k = q.permute(0, 2, 1, 3).contiguous()
+        k_k = k.permute(0, 2, 1, 3).contiguous()
+        v_k = v.permute(0, 2, 1, 3).contiguous()
 
         # Gates: (B, T, H) -> (B, H, T)
-        gates = torch.stack([i_tilde, f_tilde], dim=0)    # (2, B, T, H)
-        gates = gates.permute(0, 1, 3, 2).contiguous()    # (2, B, H, T)
-        i_k, f_k = gates.unbind(0)
+        i_k = i_tilde.permute(0, 2, 1).contiguous()
+        f_k = f_tilde.permute(0, 2, 1).contiguous()
 
         m_k = m.unsqueeze(-1)
 
         h_k, (C_out, n_out, m_out_k) = self._mlstm_backend(
             q=q_k, k=k_k, v=v_k, i=i_k, f=f_k,
-            c_initial=C, n_initial=n, m_initial=m_k,
+            c_initial=C * sf, n_initial=n * sf, m_initial=m_k,
             return_last_states=True,
         )
 
@@ -750,6 +759,8 @@ class mLSTM(nn.Module):
         h_out = o * h_out
 
         m_out = m_out_k.squeeze(-1)
+        C_out = C_out / sf
+        n_out = n_out / sf
 
         return h_out, C_out, n_out, m_out
 
@@ -769,8 +780,22 @@ class mLSTM(nn.Module):
         if not isinstance(state, tuple):
             state = (state,)
 
+        # Pre-allocate output state buffers (one per layer) to avoid
+        # creating new tensors per layer per forward pass.  These are fresh
+        # tensors that participate in autograd normally and are safe for
+        # TBPTT (detach_states / zero_rows work identically).
+        out_states: List[mLSTMState] = []
+        for layer_idx in range(self.num_layers):
+            Hh = self.num_heads[layer_idx]
+            Dh = self.hidden_size // Hh
+            D = self.num_directions
+            out_states.append(mLSTMState(
+                C=torch.empty(D, B, Hh, Dh, Dh, device=input.device, dtype=input.dtype),
+                n=torch.empty(D, B, Hh, Dh, device=input.device, dtype=input.dtype),
+                m=torch.empty(D, B, Hh, device=input.device, dtype=input.dtype),
+            ))
+
         layer_input = input
-        final_states: List[mLSTMState] = []
 
         for layer_idx in range(self.num_layers):
             s_l = state[layer_idx]
@@ -791,14 +816,11 @@ class mLSTM(nn.Module):
                     )
 
                 layer_output = out
-                final_states.append(mLSTMState(
-                    C_out.unsqueeze(0), n_out.unsqueeze(0), m_out.unsqueeze(0),
-                ))
+                out_states[layer_idx].C[0].copy_(C_out)
+                out_states[layer_idx].n[0].copy_(n_out)
+                out_states[layer_idx].m[0].copy_(m_out)
             else:
                 dir_outputs: List[torch.Tensor] = []
-                C_dirs: List[torch.Tensor] = []
-                n_dirs: List[torch.Tensor] = []
-                m_dirs: List[torch.Tensor] = []
 
                 for d in range(self.num_directions):
                     if d == 1:
@@ -822,16 +844,11 @@ class mLSTM(nn.Module):
                         out = torch.flip(out, [1])
 
                     dir_outputs.append(out)
-                    C_dirs.append(C_out)
-                    n_dirs.append(n_out)
-                    m_dirs.append(m_out)
+                    out_states[layer_idx].C[d].copy_(C_out)
+                    out_states[layer_idx].n[d].copy_(n_out)
+                    out_states[layer_idx].m[d].copy_(m_out)
 
                 layer_output = torch.cat(dir_outputs, dim=-1)
-                final_states.append(mLSTMState(
-                    torch.stack(C_dirs, dim=0),
-                    torch.stack(n_dirs, dim=0),
-                    torch.stack(m_dirs, dim=0),
-                ))
 
             if layer_idx < self.num_layers - 1:
                 layer_output = self.dropout(layer_output)
@@ -841,7 +858,7 @@ class mLSTM(nn.Module):
         if not self.batch_first:
             layer_output = layer_output.transpose(0, 1)
 
-        result = tuple(final_states)
+        result = tuple(out_states)
         if not self.pack_state and self.num_layers == 1:
             return layer_output, result[0]
         return layer_output, result
