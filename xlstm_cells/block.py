@@ -155,7 +155,18 @@ class mLSTMBlock(nn.Module):
         self,
         x: torch.Tensor,
         state: Optional[mLSTMState] = None,
+        boundaries: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, mLSTMState]:
+        """Run the residual block.
+
+        Args:
+            x: (B, T, d_model) input.
+            state: prior `mLSTMState`; `None` zero-initialises.
+            boundaries: optional (B, T) bool tensor marking the FIRST
+                position of every packed document. Pass-through to the
+                inner ``mLSTM.forward``. See ``mLSTM.forward`` for the
+                math.
+        """
         residual = x
         x = self.ln(x)
 
@@ -172,7 +183,7 @@ class mLSTMBlock(nn.Module):
         h = F.silu(h)                               # Swish activation
         h = h + self.learnable_skip                 # learnable per-channel bias
 
-        h, state = self.lstm(h, state)              # mLSTM recurrence
+        h, state = self.lstm(h, state, boundaries=boundaries)  # mLSTM recurrence
 
         gn_weight = self.gn.weight
         gn_bias = self.gn.bias
@@ -276,7 +287,18 @@ class sLSTMBlock(nn.Module):
         self,
         x: torch.Tensor,
         state: Optional[sLSTMState] = None,
+        boundaries: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, sLSTMState]:
+        """Run the residual block.
+
+        Args:
+            x: (B, T, d_model) input.
+            state: prior `sLSTMState`; `None` zero-initialises.
+            boundaries: optional (B, T) bool tensor marking the FIRST
+                position of every packed document. Pass-through to the
+                inner ``sLSTM.forward``. See ``sLSTM.forward`` for the
+                math.
+        """
         residual = x
         x = self.ln(x)
 
@@ -287,7 +309,7 @@ class sLSTMBlock(nn.Module):
             c = c.transpose(1, 2)                  # (B, T, d_model)
             x = x + F.silu(c)                       # additive conv with Swish
 
-        x, state = self.lstm(x, state)              # sLSTM recurrence
+        x, state = self.lstm(x, state, boundaries=boundaries)  # sLSTM recurrence
 
         gn_weight = self.gn.weight
         gn_bias = self.gn.bias

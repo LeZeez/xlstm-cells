@@ -22,6 +22,11 @@ from torch.utils.checkpoint import checkpoint as _torch_checkpoint
 import torch.nn as nn
 import torch.nn.functional as F
 
+from ._utils import (
+    PackedBoundariesMode,
+    get_packed_boundaries_override_mode,
+)
+
 try:
     from mlstm_kernels.torch.backend_module import (
         mLSTMBackendConfig,
@@ -651,12 +656,13 @@ class mLSTM(nn.Module):
         C: torch.Tensor,
         n: torch.Tensor,
         m: torch.Tensor,
+        boundaries: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         if (self._use_triton_kernels
                 and x.is_cuda
                 and x.size(1) % self._chunk_size == 0
                 and not torch._dynamo.is_compiling()):
-            return self._run_layer_kernels(x, d, layer_idx, C, n, m)
+            return self._run_layer_kernels(x, d, layer_idx, C, n, m, boundaries)
 
         # Warn once if triton was requested but can't be used
         if self._use_triton_kernels:
@@ -690,7 +696,7 @@ class mLSTM(nn.Module):
                 warnings.warn(msg, stacklevel=3)
                 _triton_fallback_warned = True
 
-        return self._run_layer_native(x, d, layer_idx, C, n, m)
+        return self._run_layer_native(x, d, layer_idx, C, n, m, boundaries=boundaries)
 
     def _run_layer_native(
         self,
@@ -700,10 +706,23 @@ class mLSTM(nn.Module):
         C: torch.Tensor,
         n: torch.Tensor,
         m: torch.Tensor,
+        boundaries: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         q, k, v, o, i_tilde, log_f = self._project_sequence(
             x, d, layer_idx, apply_activations=True,
         )
+        if boundaries is not None:
+            # The native scan takes the ALREADY-LOG-SIGMOIDED forget gate;
+            # override `log_f` so the recurrence sees an effectively-zero
+            # cumulative forgetting factor at boundary positions. We
+            # derive `log_f` here from `f_tilde_raw` for the override, but
+            # since logsigmoid(-30) ≈ -30 we just patch the log_f value
+            # directly to a very negative constant -- this matches the
+            # value of `logsigmoid(-30.0)` to within bf16 precision.
+            log_f = log_f.masked_fill(
+                boundaries.to(device=log_f.device, dtype=torch.bool).unsqueeze(-1),
+                -30.0,
+            )
         return _mlstm_recurrent_scan_parallel_chunked(
             q, k, v, o, i_tilde, log_f, C, n, m,
             chunk_size=self._chunk_size,
@@ -717,6 +736,7 @@ class mLSTM(nn.Module):
         C: torch.Tensor,
         n: torch.Tensor,
         m: torch.Tensor,
+        boundaries: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         Hh = self.num_heads[layer_idx]
         Dh = self.hidden_size // Hh
@@ -734,6 +754,17 @@ class mLSTM(nn.Module):
         # both paths produce identical outputs and interchangeable states
         # (TBPTT can mix kernel and native segments freely).
         k = k * sf
+
+        # Pack-aware state reset: override f_tilde at boundary positions
+        # so logsigmoid(f_tilde) ≈ -30 contributes a near-zero cumulative
+        # forgetting factor to the chunkwise recurrence at those positions.
+        # The recurrent state entering via the chunkwise scaG accumulator
+        # effectively drops to zero from the boundary onward -- equivalent
+        # to "starting fresh" for the next packed document. See
+        # PACKED_FORGET_RESET_RESULTS.md for the math.
+        if boundaries is not None:
+            b = boundaries.to(device=f_tilde.device, dtype=torch.bool).unsqueeze(-1)
+            f_tilde = f_tilde.masked_fill(b, -30.0)
 
         # Permute (B,T,H,Dh) -> (B,H,T,Dh) for triton kernels.
         # Individual permute+contiguous avoids the intermediate stacked tensor
@@ -768,7 +799,23 @@ class mLSTM(nn.Module):
         self,
         input: torch.Tensor,
         state=None,
+        boundaries: Optional[torch.Tensor] = None,
     ):
+        """Run mLSTM recurrence over `input`.
+
+        Args:
+            input: (B, T, input_size) when batch_first=True.
+            state: prior `mLSTMState`(s); `None` initialises at zero.
+            boundaries: optional bool tensor of shape (B, T) marking the
+                FIRST position of every packed document. At those
+                positions the raw forget-gate is forced to -30, killing
+                the cumulative carry into the chunkwise recurrence from
+                that point onward (effectively resetting the recurrent
+                state). Enables sequence packing without padding pollution.
+
+        See ``PACKED_FORGET_RESET_RESULTS.md`` for the math and the
+        interplay with activation checkpointing.
+        """
         if not self.batch_first:
             input = input.transpose(0, 1)
 
@@ -779,6 +826,26 @@ class mLSTM(nn.Module):
 
         if not isinstance(state, tuple):
             state = (state,)
+
+        # When the user passes `boundaries`, decide how to interact with
+        # activation checkpointing globally. The chosen mode lives in
+        # xlstm_cells._utils.PackedBoundariesMode.
+        packed = boundaries is not None
+        bounds_mode = get_packed_boundaries_override_mode()
+        ckpt_active = bool(self.use_checkpoint and self.training)
+        if packed and bounds_mode == PackedBoundariesMode.DISABLE_CKPT_IN_PACKED:
+            ckpt_active = False
+        ckpt_use_reentrant = False
+        if packed and ckpt_active and bounds_mode == PackedBoundariesMode.USE_REENTRANT_CKPT:
+            # The boundaries override adds an extra autograd edge inside
+            # `_run_layer`, which trips the saved-tensor count check at
+            # torch.utils.checkpoint:873 under use_reentrant=False.
+            # Switching to use_reentrant=True avoids the check (the ckpt
+            # function will recompute the wrapped fn during backward
+            # instead, which doesn't run any count check) AND is strictly
+            # more memory-efficient (no activations cached between
+            # forward and backward).
+            ckpt_use_reentrant = True
 
         # Pre-allocate output state buffers (one per layer) to avoid
         # creating new tensors per layer per forward pass.  These are fresh
@@ -805,14 +872,16 @@ class mLSTM(nn.Module):
                 n_dl = s_l.n.squeeze(0)
                 m_dl = s_l.m.squeeze(0)
 
-                if self.use_checkpoint and self.training:
+                if ckpt_active:
                     out, C_out, n_out, m_out = _torch_checkpoint(
-                        self._run_layer, layer_input, 0, layer_idx, C_dl, n_dl, m_dl,
-                        use_reentrant=False,
+                        self._run_layer, layer_input, 0, layer_idx,
+                        C_dl, n_dl, m_dl, boundaries,
+                        use_reentrant=ckpt_use_reentrant,
                     )
                 else:
                     out, C_out, n_out, m_out = self._run_layer(
                         layer_input, 0, layer_idx, C_dl, n_dl, m_dl,
+                        boundaries=boundaries,
                     )
 
                 layer_output = out
@@ -830,14 +899,16 @@ class mLSTM(nn.Module):
                     n_dl = s_l.n[d]
                     m_dl = s_l.m[d]
 
-                    if self.use_checkpoint and self.training:
+                    if ckpt_active:
                         out, C_out, n_out, m_out = _torch_checkpoint(
-                            self._run_layer, layer_input, d, layer_idx, C_dl, n_dl, m_dl,
-                            use_reentrant=False,
+                            self._run_layer, layer_input, d, layer_idx,
+                            C_dl, n_dl, m_dl, boundaries,
+                            use_reentrant=ckpt_use_reentrant,
                         )
                     else:
                         out, C_out, n_out, m_out = self._run_layer(
                             layer_input, d, layer_idx, C_dl, n_dl, m_dl,
+                            boundaries=boundaries,
                         )
 
                     if d == 1:

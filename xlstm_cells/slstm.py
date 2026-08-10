@@ -21,6 +21,11 @@ from torch.utils.checkpoint import checkpoint as _torch_checkpoint
 import torch.nn as nn
 import torch.nn.functional as F
 
+from ._utils import (
+    PackedBoundariesMode,
+    get_packed_boundaries_override_mode,
+)
+
 _EPS = 1e-6
 
 
@@ -83,6 +88,7 @@ def _slstm_scan_sequential(
     n: torch.Tensor,
     m: torch.Tensor,
     h: torch.Tensor,
+    boundaries: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     r"""Run sLSTM recurrence over the full sequence in a single for-loop.
 
@@ -98,10 +104,32 @@ def _slstm_scan_sequential(
         n:       (B, H, Dh)          normalizer before sequence
         m:       (B, H, Dh)          stabiliser before sequence
         h:       (B, H, Dh)          hidden state before sequence
+        boundaries:    optional (B, T) bool -- True at the FIRST position
+                       of every packed document.  At those positions the
+                       raw forget gate ``f_tilde`` is overridden to -30
+                       so its log_sigmoid ≈ -30 contributes a near-zero
+                       cumulative forgetting factor to the recurrence,
+                       effectively resetting the (c, n, m) state from
+                       that point onward.
 
     Returns:
         outputs:  (B, T, hidden_size)
         c, n, m, h: final states after full sequence
+
+    .. note::
+        The boundary reset is an approximation.  Setting ``f_tilde=-30``
+        at a boundary yields ``f' = exp(logsig(-30) + m_prev - m_new)``
+        which is ~0 only when ``m_new`` is driven by ``i_tilde`` (the
+        ``m_new = max(...)`` formula picks max of m+logsig(f) and
+        i_tilde).  For typical trained models, ``m`` tracks soft values
+        in the 0-20 range and the override is near-bit-exact in bf16.
+        At boundary, m_new ≈ i_tilde, f_prime ≈ 0; carry into c, n is
+        effectively killed.  The next non-boundary position recovers
+        from the freshly-set m normally via the standard recurrence.
+        With abnormally-large prior m (e.g., >30 over very long
+        contexts), the boundary's c-state leak is bounded by
+        ``exp(min(0, i_tilde - m_prev + 30))`` -- still small in
+        practice.
     """
     _eps_local = _EPS
     B, T, H, Dh_x4 = all_in.shape
@@ -109,9 +137,22 @@ def _slstm_scan_sequential(
     hidden_size = H * Dh
     output_list: List[torch.Tensor] = []
 
+    if boundaries is not None:
+        b_dev = boundaries.to(device=all_in.device, dtype=torch.bool)
+    else:
+        b_dev = None
+
     for t in range(T):
         all_tilde = all_in[:, t] + torch.einsum("bhd,hde->bhe", h, R_fused)
         z_tilde, i_tilde, f_tilde, o_tilde = all_tilde.chunk(4, dim=-1)
+
+        # Boundary reset: override f_tilde to -30 at boundary positions.
+        # Then log_f = logsigmoid(f_tilde) ~ -30, which in
+        # m_new = max(log_f + m, i_tilde) loses to i_tilde, so m_new ≈
+        # i_tilde. f_prime = exp(log_f + m - m_new) is then ~exp(-30).
+        if b_dev is not None:
+            b_t = b_dev[:, t].view(B, 1, 1)
+            f_tilde = torch.where(b_t, torch.full_like(f_tilde, -30.0), f_tilde)
 
         z = torch.tanh(z_tilde)
         o = torch.sigmoid(o_tilde)
@@ -395,12 +436,13 @@ class sLSTM(nn.Module):
     def _run_layer(
         self, x: torch.Tensor, d: int, layer_idx: int,
         c: torch.Tensor, n: torch.Tensor, m: torch.Tensor, h: torch.Tensor,
+        boundaries: Optional[torch.Tensor] = None,
     ):
         all_in = self._project_sequence(x, d, layer_idx)
         R_fused = getattr(self, f"R_fused_{d}_{layer_idx}")
 
         if not self.fast_mode:
-            return _slstm_scan_sequential(all_in, R_fused, c, n, m, h)
+            return _slstm_scan_sequential(all_in, R_fused, c, n, m, h, boundaries)
 
         if self._compiled_chunk is None:
             self._compiled_chunk = torch.compile(
@@ -411,24 +453,55 @@ class sLSTM(nn.Module):
         C = self.fast_chunk_size
         outputs_chunks = []
 
+        # If boundaries are present, slice them per chunk so the inner
+        # torch.compile graph sees the same signature.
+        if boundaries is not None:
+            b_chunks = []
+            i = 0
+            while i + C <= T:
+                b_chunks.append(boundaries[:, i:i + C])
+                i += C
+            if i < T:
+                b_chunks.append(boundaries[:, i:])
+        else:
+            b_chunks = [None] * ((T + C - 1) // C)
+
         t = 0
+        idx = 0
         while t + C <= T:
             out_c, c, n, m, h = self._compiled_chunk(
-                all_in[:, t:t + C], R_fused, c, n, m, h,
+                all_in[:, t:t + C], R_fused, c, n, m, h, b_chunks[idx],
             )
             outputs_chunks.append(out_c)
             t += C
+            idx += 1
 
         if t < T:
             out_c, c, n, m, h = _slstm_scan_sequential(
-                all_in[:, t:], R_fused, c, n, m, h,
+                all_in[:, t:], R_fused, c, n, m, h, b_chunks[idx],
             )
             outputs_chunks.append(out_c)
 
         outputs = torch.cat(outputs_chunks, dim=1)
         return outputs, c, n, m, h
 
-    def forward(self, input: torch.Tensor, state=None):
+    def forward(
+        self,
+        input: torch.Tensor,
+        state=None,
+        boundaries: Optional[torch.Tensor] = None,
+    ):
+        """Run sLSTM recurrence over `input`.
+
+        Args:
+            input: (B, T, input_size) when batch_first=True.
+            state: prior `sLSTMState`(s); `None` zero-initialises.
+            boundaries: optional (B, T) bool tensor marking the FIRST
+                position of every packed document. At boundary
+                positions the raw forget gate ``f_tilde`` is forced to
+                -30, killing the cumulative forgetting factor past
+                that position.  See ``PACKED_FORGET_RESET_RESULTS.md``.
+        """
         if not self.batch_first:
             input = input.transpose(0, 1)
 
@@ -438,6 +511,17 @@ class sLSTM(nn.Module):
             state = self.init_state(B, device=input.device, dtype=input.dtype)
         if not isinstance(state, tuple):
             state = (state,)
+
+        # When `boundaries` is passed, decide how to interact with
+        # activation checkpointing per the global PackedBoundariesMode.
+        packed = boundaries is not None
+        bounds_mode = get_packed_boundaries_override_mode()
+        ckpt_active = bool(self.use_checkpoint and self.training)
+        if packed and bounds_mode == PackedBoundariesMode.DISABLE_CKPT_IN_PACKED:
+            ckpt_active = False
+        ckpt_use_reentrant = False
+        if packed and ckpt_active and bounds_mode == PackedBoundariesMode.USE_REENTRANT_CKPT:
+            ckpt_use_reentrant = True
 
         layer_input = input
         final_states: List[sLSTMState] = []
@@ -451,14 +535,16 @@ class sLSTM(nn.Module):
                 m_dl = s_l.m.squeeze(0)
                 h_dl = s_l.h.squeeze(0)
 
-                if self.use_checkpoint and self.training:
+                if ckpt_active:
                     out, c_out, n_out, m_out, h_out = _torch_checkpoint(
                         self._run_layer, layer_input, 0, layer_idx,
-                        c_dl, n_dl, m_dl, h_dl, use_reentrant=False,
+                        c_dl, n_dl, m_dl, h_dl, boundaries,
+                        use_reentrant=ckpt_use_reentrant,
                     )
                 else:
                     out, c_out, n_out, m_out, h_out = self._run_layer(
                         layer_input, 0, layer_idx, c_dl, n_dl, m_dl, h_dl,
+                        boundaries=boundaries,
                     )
 
                 layer_output = out
@@ -482,14 +568,16 @@ class sLSTM(nn.Module):
                     m_dl = s_l.m[d]
                     h_dl = s_l.h[d]
 
-                    if self.use_checkpoint and self.training:
+                    if ckpt_active:
                         out, c_out, n_out, m_out, h_out = _torch_checkpoint(
                             self._run_layer, layer_input, d, layer_idx,
-                            c_dl, n_dl, m_dl, h_dl, use_reentrant=False,
+                            c_dl, n_dl, m_dl, h_dl, boundaries,
+                            use_reentrant=ckpt_use_reentrant,
                         )
                     else:
                         out, c_out, n_out, m_out, h_out = self._run_layer(
                             layer_input, d, layer_idx, c_dl, n_dl, m_dl, h_dl,
+                            boundaries=boundaries,
                         )
 
                     if d == 1:

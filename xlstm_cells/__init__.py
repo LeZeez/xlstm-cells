@@ -26,9 +26,15 @@ Usage:
 from .mlstm import mLSTMCell, mLSTM, mLSTMState
 from .slstm import sLSTMCell, sLSTM, sLSTMState
 from .block import mLSTMBlock, sLSTMBlock
-from ._utils import detach_states, zero_rows
+from ._utils import (
+    detach_states,
+    zero_rows,
+    PackedBoundariesMode,
+    get_packed_boundaries_override_mode,
+    set_packed_boundaries_override_mode,
+)
 
-__version__ = "0.5.5"
+__version__ = "0.5.6"
 __all__ = [
     "mLSTMCell",
     "mLSTM",
@@ -40,4 +46,7 @@ __all__ = [
     "sLSTMBlock",
     "detach_states",
     "zero_rows",
+    "PackedBoundariesMode",
+    "get_packed_boundaries_override_mode",
+    "set_packed_boundaries_override_mode",
 ]
