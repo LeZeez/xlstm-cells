@@ -151,7 +151,7 @@ Only active during `model.train()`. Combine with TBPTT for maximum memory effici
 Both `mLSTM`/`mLSTMBlock` and `sLSTM`/`sLSTMBlock` accept an optional `boundaries` keyword:
 
 ```python
-b = torch.zeros(B, T, dtype=torch.bool, device)
+b = torch.zeros(B, T, dtype=torch.bool, device=x.device)
 b[:, boundary_positions] = True       # True at the FIRST token of every packed doc
 
 out, state = block(x, state, boundaries=b)

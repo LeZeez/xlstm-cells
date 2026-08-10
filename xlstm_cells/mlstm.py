@@ -895,6 +895,18 @@ class mLSTM(nn.Module):
                     if d == 1:
                         layer_input = torch.flip(layer_input, [1])
 
+                    # Direction-local boundary: in the reverse direction
+                    # (d == 1) the input has been flipped, so position j in
+                    # the flipped stream corresponds to original position
+                    # (T-1-j). The boundary mask must flip with the input
+                    # so a boundary at original position p triggers the
+                    # forget-gate override at flipped position (T-1-p)
+                    # -- which is where the reverse recurrence is
+                    # processing original token p.
+                    b_d = boundaries
+                    if d == 1 and boundaries is not None:
+                        b_d = torch.flip(boundaries, [1])
+
                     C_dl = s_l.C[d]
                     n_dl = s_l.n[d]
                     m_dl = s_l.m[d]
@@ -902,13 +914,13 @@ class mLSTM(nn.Module):
                     if ckpt_active:
                         out, C_out, n_out, m_out = _torch_checkpoint(
                             self._run_layer, layer_input, d, layer_idx,
-                            C_dl, n_dl, m_dl, boundaries,
+                            C_dl, n_dl, m_dl, b_d,
                             use_reentrant=ckpt_use_reentrant,
                         )
                     else:
                         out, C_out, n_out, m_out = self._run_layer(
                             layer_input, d, layer_idx, C_dl, n_dl, m_dl,
-                            boundaries=boundaries,
+                            boundaries=b_d,
                         )
 
                     if d == 1:
