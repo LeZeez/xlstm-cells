@@ -27,6 +27,8 @@ from ._utils import (
 )
 
 _EPS = 1e-6
+_BOUNDARY_RESET_LOGF = -1000.0
+_MAX_FORGET_BIAS = 8.0
 
 
 # ---------------------------------------------------------------------------
@@ -106,30 +108,26 @@ def _slstm_scan_sequential(
         h:       (B, H, Dh)          hidden state before sequence
         boundaries:    optional (B, T) bool -- True at the FIRST position
                        of every packed document.  At those positions the
-                       raw forget gate ``f_tilde`` is overridden to -30
-                       so its log_sigmoid ≈ -30 contributes a near-zero
-                       cumulative forgetting factor to the recurrence,
-                       effectively resetting the (c, n, m) state from
-                       that point onward.
+                       raw forget gate ``f_tilde`` is overridden to
+                       _BOUNDARY_RESET_LOGF (-1000) so its log_sigmoid
+                       contributes a near-zero cumulative forgetting
+                       factor to the recurrence, effectively resetting
+                       the (c, n, m) state from that point onward.
 
     Returns:
         outputs:  (B, T, hidden_size)
         c, n, m, h: final states after full sequence
 
     .. note::
-        The boundary reset is an approximation.  Setting ``f_tilde=-30``
-        at a boundary yields ``f' = exp(logsig(-30) + m_prev - m_new)``
-        which is ~0 only when ``m_new`` is driven by ``i_tilde`` (the
-        ``m_new = max(...)`` formula picks max of m+logsig(f) and
-        i_tilde).  For typical trained models, ``m`` tracks soft values
-        in the 0-20 range and the override is near-bit-exact in bf16.
-        At boundary, m_new ≈ i_tilde, f_prime ≈ 0; carry into c, n is
-        effectively killed.  The next non-boundary position recovers
-        from the freshly-set m normally via the standard recurrence.
-        With abnormally-large prior m (e.g., >30 over very long
-        contexts), the boundary's c-state leak is bounded by
-        ``exp(min(0, i_tilde - m_prev + 30))`` -- still small in
-        practice.
+        The boundary reset overrides ``f_tilde`` with a large negative
+        constant (_BOUNDARY_RESET_LOGF = -1000).  This yields
+        ``f' = exp(logsig(-1000) + m_prev - m_new) ≈ 0`` unconditionally
+        for any realistic ``m_prev``, since ``m_new`` is driven by
+        ``i_tilde`` (the ``m_new = max(...)`` formula picks max of
+        m + logsig(f) and i_tilde).  At boundary, m_new ≈ i_tilde,
+        f_prime ≈ 0; carry into c, n is effectively killed.  The reset
+        holds for any m_prev < i_tilde + 1000, which covers all
+        realistic scenarios.
     """
     _eps_local = _EPS
     B, T, H, Dh_x4 = all_in.shape
@@ -146,13 +144,13 @@ def _slstm_scan_sequential(
         all_tilde = all_in[:, t] + torch.einsum("bhd,hde->bhe", h, R_fused)
         z_tilde, i_tilde, f_tilde, o_tilde = all_tilde.chunk(4, dim=-1)
 
-        # Boundary reset: override f_tilde to -30 at boundary positions.
-        # Then log_f = logsigmoid(f_tilde) ~ -30, which in
-        # m_new = max(log_f + m, i_tilde) loses to i_tilde, so m_new ≈
-        # i_tilde. f_prime = exp(log_f + m - m_new) is then ~exp(-30).
+        # Boundary reset: override f_tilde at boundary positions.
+        # logsigmoid(_BOUNDARY_RESET_LOGF) ≈ _BOUNDARY_RESET_LOGF, so
+        # m_new = max(log_f + m, i_tilde) is dominated by i_tilde for
+        # any realistic m, and f_prime ≈ exp(-1000) ≈ 0.
         if b_dev is not None:
             b_t = b_dev[:, t].view(B, 1, 1)
-            f_tilde = torch.where(b_t, torch.full_like(f_tilde, -30.0), f_tilde)
+            f_tilde = torch.where(b_t, torch.full_like(f_tilde, _BOUNDARY_RESET_LOGF), f_tilde)
 
         z = torch.tanh(z_tilde)
         o = torch.sigmoid(o_tilde)
@@ -291,6 +289,19 @@ class sLSTMCell(nn.Module):
         h_new = o * (c_new / n_new.clamp_min(_EPS))
 
         return h_new.reshape(B, self.hidden_size), sLSTMState(c_new, n_new, m_new, h_new)
+
+    @torch.no_grad()
+    def clamp_forget_bias(self, max_val: float = _MAX_FORGET_BIAS) -> None:
+        """Clamp the forget-gate bias to [-max_val, max_val].
+
+        Call after ``optimizer.step()`` to prevent the forget bias from
+        drifting into saturation (logsigmoid(b_f) ≈ 0), which causes
+        the log-normalizer m to grow unboundedly and can make the
+        boundary reset ineffective.
+        """
+        HS = self.hidden_size
+        if self.W_all.bias is not None:
+            self.W_all.bias.data[2*HS:3*HS].clamp_(-max_val, max_val)
 
 
 # ---------------------------------------------------------------------------
@@ -499,8 +510,9 @@ class sLSTM(nn.Module):
             boundaries: optional (B, T) bool tensor marking the FIRST
                 position of every packed document. At boundary
                 positions the raw forget gate ``f_tilde`` is forced to
-                -30, killing the cumulative forgetting factor past
-                that position.  See ``PACKED_FORGET_RESET_RESULTS.md``.
+                _BOUNDARY_RESET_LOGF (-1000), killing the cumulative
+                forgetting factor past that position.  See
+                ``PACKED_FORGET_RESET_RESULTS.md``.
         """
         if not self.batch_first:
             input = input.transpose(0, 1)
@@ -621,6 +633,22 @@ class sLSTM(nn.Module):
 
     def flatten_parameters(self) -> None:
         pass
+
+    @torch.no_grad()
+    def clamp_forget_bias(self, max_val: float = _MAX_FORGET_BIAS) -> None:
+        """Clamp the forget-gate bias to [-max_val, max_val] across all layers.
+
+        Call after ``optimizer.step()`` to prevent the forget bias from
+        drifting into saturation (logsigmoid(b_f) ≈ 0), which causes
+        the log-normalizer m to grow unboundedly and can make the
+        boundary reset ineffective.
+        """
+        HS = self.hidden_size
+        for d in range(self.num_directions):
+            for layer_idx in range(self.num_layers):
+                W = getattr(self, f"W_all_{d}_{layer_idx}")
+                if W.bias is not None:
+                    W.bias.data[2*HS:3*HS].clamp_(-max_val, max_val)
 
     def __repr__(self) -> str:
         return (

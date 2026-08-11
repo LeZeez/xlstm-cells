@@ -241,6 +241,17 @@ class mLSTMBlock(nn.Module):
     def init_state(self, batch_size: int, device=None, dtype=None):
         return self.lstm.init_state(batch_size, device, dtype)
 
+    @torch.no_grad()
+    def clamp_forget_bias(self, max_val: float = 8.0) -> None:
+        """Clamp the inner mLSTM forget-gate bias to [-max_val, max_val].
+
+        Call after ``optimizer.step()`` to prevent the forget bias from
+        drifting into saturation (logsigmoid(b_f) ≈ 0), which causes
+        the log-normalizer m to grow unboundedly and can make the
+        boundary reset ineffective.
+        """
+        self.lstm.clamp_forget_bias(max_val)
+
 
 class sLSTMBlock(nn.Module):
     """Paper-compliant sLSTM block with post up-projection.
@@ -373,3 +384,14 @@ class sLSTMBlock(nn.Module):
 
     def init_state(self, batch_size: int, device=None, dtype=None):
         return self.lstm.init_state(batch_size, device, dtype)
+
+    @torch.no_grad()
+    def clamp_forget_bias(self, max_val: float = 8.0) -> None:
+        """Clamp the inner sLSTM forget-gate bias to [-max_val, max_val].
+
+        Call after ``optimizer.step()`` to prevent the forget bias from
+        drifting into saturation (logsigmoid(b_f) ≈ 0), which causes
+        the log-normalizer m to grow unboundedly and can make the
+        boundary reset ineffective.
+        """
+        self.lstm.clamp_forget_bias(max_val)

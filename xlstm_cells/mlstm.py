@@ -36,8 +36,10 @@ try:
 except ImportError:
     _HAS_MLSTM_KERNELS = False
 
-_EPS = 1e-6
+_EPS = 1e-3
 _MLSTM_CHUNK_SIZE = 128
+_BOUNDARY_RESET_LOGF = -1000.0
+_MAX_FORGET_BIAS = 8.0
 
 # Accessible short names for the mlstm_kernels chunkwise triton kernels.
 # The shared "chunkwise--triton" prefix is omitted; see mLSTM.chunkwise_kernel.
@@ -414,6 +416,19 @@ class mLSTMCell(nn.Module):
 
         return h.reshape(B, self.hidden_size), mLSTMState(C, n, m)
 
+    @torch.no_grad()
+    def clamp_forget_bias(self, max_val: float = _MAX_FORGET_BIAS) -> None:
+        """Clamp the forget-gate bias to [-max_val, max_val].
+
+        Call after ``optimizer.step()`` to prevent the forget bias from
+        drifting into saturation (logsigmoid(b_f) ≈ 0), which causes
+        the log-normalizer m to grow unboundedly and can make the
+        boundary reset ineffective.
+        """
+        NH = self.num_heads
+        if self.W_if.bias is not None:
+            self.W_if.bias.data[NH:].clamp_(-max_val, max_val)
+
 
 # ---------------------------------------------------------------------------
 # mLSTM -- full sequence, multi-layer, bidirectional  (like nn.LSTM)
@@ -714,14 +729,15 @@ class mLSTM(nn.Module):
         if boundaries is not None:
             # The native scan takes the ALREADY-LOG-SIGMOIDED forget gate;
             # override `log_f` so the recurrence sees an effectively-zero
-            # cumulative forgetting factor at boundary positions. We
-            # derive `log_f` here from `f_tilde_raw` for the override, but
-            # since logsigmoid(-30) ≈ -30 we just patch the log_f value
-            # directly to a very negative constant -- this matches the
-            # value of `logsigmoid(-30.0)` to within bf16 precision.
+            # cumulative forgetting factor at boundary positions.  The
+            # constant must be large enough that the boundary reset is
+            # unconditional even when the log-normalizer m has drifted
+            # high (e.g. due to saturated forget biases at high LR).
+            # With -1000 the reset holds for any m < i_tilde + 1000,
+            # which covers all realistic scenarios.
             log_f = log_f.masked_fill(
                 boundaries.to(device=log_f.device, dtype=torch.bool).unsqueeze(-1),
-                -30.0,
+                _BOUNDARY_RESET_LOGF,
             )
         return _mlstm_recurrent_scan_parallel_chunked(
             q, k, v, o, i_tilde, log_f, C, n, m,
@@ -756,15 +772,15 @@ class mLSTM(nn.Module):
         k = k * sf
 
         # Pack-aware state reset: override f_tilde at boundary positions
-        # so logsigmoid(f_tilde) ≈ -30 contributes a near-zero cumulative
-        # forgetting factor to the chunkwise recurrence at those positions.
-        # The recurrent state entering via the chunkwise scaG accumulator
-        # effectively drops to zero from the boundary onward -- equivalent
-        # to "starting fresh" for the next packed document. See
-        # PACKED_FORGET_RESET_RESULTS.md for the math.
+        # so logsigmoid(f_tilde) ≈ _BOUNDARY_RESET_LOGF contributes a
+        # near-zero cumulative forgetting factor to the chunkwise
+        # recurrence at those positions.  The constant is large enough
+        # to guarantee an unconditional reset even when the log-normalizer
+        # m has drifted high (e.g. due to saturated forget biases at
+        # high LR).  See PACKED_FORGET_RESET_RESULTS.md for the math.
         if boundaries is not None:
             b = boundaries.to(device=f_tilde.device, dtype=torch.bool).unsqueeze(-1)
-            f_tilde = f_tilde.masked_fill(b, -30.0)
+            f_tilde = f_tilde.masked_fill(b, _BOUNDARY_RESET_LOGF)
 
         # Permute (B,T,H,Dh) -> (B,H,T,Dh) for triton kernels.
         # Individual permute+contiguous avoids the intermediate stacked tensor
@@ -808,10 +824,11 @@ class mLSTM(nn.Module):
             state: prior `mLSTMState`(s); `None` initialises at zero.
             boundaries: optional bool tensor of shape (B, T) marking the
                 FIRST position of every packed document. At those
-                positions the raw forget-gate is forced to -30, killing
-                the cumulative carry into the chunkwise recurrence from
-                that point onward (effectively resetting the recurrent
-                state). Enables sequence packing without padding pollution.
+                positions the raw forget-gate is forced to
+                _BOUNDARY_RESET_LOGF (-1000), killing the cumulative
+                carry into the chunkwise recurrence from that point
+                onward (effectively resetting the recurrent state).
+                Enables sequence packing without padding pollution.
 
         See ``PACKED_FORGET_RESET_RESULTS.md`` for the math and the
         interplay with activation checkpointing.
@@ -948,6 +965,22 @@ class mLSTM(nn.Module):
 
     def flatten_parameters(self) -> None:
         pass
+
+    @torch.no_grad()
+    def clamp_forget_bias(self, max_val: float = _MAX_FORGET_BIAS) -> None:
+        """Clamp the forget-gate bias to [-max_val, max_val] across all layers.
+
+        Call after ``optimizer.step()`` to prevent the forget bias from
+        drifting into saturation (logsigmoid(b_f) ≈ 0), which causes
+        the log-normalizer m to grow unboundedly and can make the
+        boundary reset ineffective.
+        """
+        for d in range(self.num_directions):
+            for layer_idx in range(self.num_layers):
+                Hh = self.num_heads[layer_idx]
+                W_if = getattr(self, f"W_if_{d}_{layer_idx}")
+                if W_if.bias is not None:
+                    W_if.bias.data[Hh:].clamp_(-max_val, max_val)
 
     def __repr__(self) -> str:
         return (
