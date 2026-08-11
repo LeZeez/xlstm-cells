@@ -853,16 +853,11 @@ class mLSTM(nn.Module):
         if packed and bounds_mode == PackedBoundariesMode.DISABLE_CKPT_IN_PACKED:
             ckpt_active = False
         ckpt_use_reentrant = False
-        if packed and ckpt_active and bounds_mode == PackedBoundariesMode.USE_REENTRANT_CKPT:
-            # The boundaries override adds an extra autograd edge inside
-            # `_run_layer`, which trips the saved-tensor count check at
-            # torch.utils.checkpoint:873 under use_reentrant=False.
-            # Switching to use_reentrant=True avoids the check (the ckpt
-            # function will recompute the wrapped fn during backward
-            # instead, which doesn't run any count check) AND is strictly
-            # more memory-efficient (no activations cached between
-            # forward and backward).
-            ckpt_use_reentrant = True
+        # PackedBoundariesMode.USE_REENTRANT_CKPT is no longer applied; the
+        # boundaries override is compatible with use_reentrant=False on modern
+        # PyTorch, and non-reentrant is more robust under detached-input /
+        # frozen-embedding TBPTT (same VRAM envelope, no silent grad loss).
+        # See tests/test_packed_non_reentrant.py.
 
         # Pre-allocate output state buffers (one per layer) to avoid
         # creating new tensors per layer per forward pass.  These are fresh

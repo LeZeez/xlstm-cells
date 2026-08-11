@@ -8,28 +8,25 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 
 # ---------------------------------------------------------------------------
-# PackedBoundariesMode -- how the (mLSTM/sLSTM).forward boundaries= kwarg
-# interacts with activation checkpointing during packed-document sequences.
+# PackedBoundariesMode -- legacy knob for how (mLSTM/sLSTM).forward
+# boundaries= kwarg interacted with activation checkpointing under packed-
+# document sequences.  USE_REENTRANT_CKPT is now a no-op: the boundaries
+# override is compatible with use_reentrant=False on modern PyTorch, and the
+# non-reentrant path is preferred for detached-input / frozen-embedding
+# TBPTT.  See tests/test_packed_non_reentrant.py.
 # ---------------------------------------------------------------------------
 
 class PackedBoundariesMode(Enum):
-    """How `boundaries=...` interacts with `use_checkpoint=True`.
+    """How `boundaries=...` interacts with `use_checkpoint=True` (legacy).
 
     USE_REENTRANT_CKPT (default):
-        When the user passes `boundaries=...` and `use_checkpoint=True`, the
-        inner `_torch_checkpoint` call is switched to `use_reentrant=True`
-        for the duration of that single forward. This avoids the
-        saved-tensor count check at torch.utils.checkpoint:873 that
-        triggers when the wrapper adds an extra saved tensor via the
-        autograd graph (which the boundaries override does). Strictly
-        more memory-efficient than `use_reentrant=False`.
+        Maintained for backwards compatibility.  No longer forces a switch
+        to `use_reentrant=True` -- the runtime uses the non-reentrant path
+        in all cases.
 
     DISABLE_CKPT_IN_PACKED:
-        Fallback path. When the user passes `boundaries=...`,
-        `use_checkpoint` is silenced (set to False) for the duration of
-        that forward call. The chunkwise kernel recomputes activations
-        in the standard way, no override behaviour. Slower per backward
-        (full activations kept), but works on any kernel / GPU.
+        When the user passes `boundaries=...`, `use_checkpoint` is silenced
+        (set to False) for the duration of that forward call. Still honoured.
 
     Default is USE_REENTRANT_CKPT. Set globally via
     `set_packed_boundaries_override_mode(...)`.
@@ -50,6 +47,11 @@ def set_packed_boundaries_override_mode(
 ) -> PackedBoundariesMode:
     """Set the global default for how `boundaries=...` interacts with
     activation checkpointing. Returns the previous mode.
+
+    .. note::
+        Setting this to ``USE_REENTRANT_CKPT`` is a no-op as of the
+        non-reentrant switch. Only ``DISABLE_CKPT_IN_PACKED`` alters
+        runtime behaviour.
     """
     global _GLOBAL_BOUNDS_MODE
     prev = _GLOBAL_BOUNDS_MODE

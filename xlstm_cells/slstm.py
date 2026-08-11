@@ -531,9 +531,8 @@ class sLSTM(nn.Module):
         ckpt_active = bool(self.use_checkpoint and self.training)
         if packed and bounds_mode == PackedBoundariesMode.DISABLE_CKPT_IN_PACKED:
             ckpt_active = False
+        # USE_REENTRANT_CKPT no longer applied -- see PACKED_FORGET_RESET_RESULTS.md / mLSTM for rationale.
         ckpt_use_reentrant = False
-        if packed and ckpt_active and bounds_mode == PackedBoundariesMode.USE_REENTRANT_CKPT:
-            ckpt_use_reentrant = True
 
         layer_input = input
         final_states: List[sLSTMState] = []

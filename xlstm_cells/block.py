@@ -73,21 +73,21 @@ def _segment_aware_pre_conv(
     applies to any sequence start.
 
     Returns `h` unchanged when `boundaries is None`, ``K_m1 <= 0``, or
-    the sequence is too short for the unfold window.
+    ``T == 0``.
+
+    Handles boundaries at/near the sequence end (p > T-K_m1): the
+    right-padded boundary mask produces windows for every start i in
+    [0, T), so a doc ending at T-1 no longer leaks its tail into the
+    conv kernel.  See tests/test_segment_aware_pre_conv.py.
     """
     if boundaries is None or K_m1 <= 0:
         return h
     B, T, _ = h.shape
-    if T <= K_m1:
+    if T == 0:
         return h
-    # recent[i] = boundaries[i+1 : i+K_m1+1] of shape (B, T-K_m1, K_m1)
-    windows = boundaries.unfold(1, K_m1 + 1, 1)[:, :, 1:]
-    fresh = windows.any(dim=-1)  # (B, T-K_m1)
-    if fresh.numel() == 0:
-        return h
-    mask = torch.zeros(B, T, dtype=torch.bool, device=h.device)
-    mask[:, :fresh.shape[1]] = fresh
-    return h.masked_fill(mask.unsqueeze(-1), 0.0)
+    b_pad = F.pad(boundaries, (0, K_m1), value=False)
+    fresh = b_pad.unfold(1, K_m1 + 1, 1)[:, :, 1:].any(dim=-1)
+    return h.masked_fill(fresh.unsqueeze(-1), 0.0)
 
 
 class mLSTMBlock(nn.Module):
