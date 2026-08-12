@@ -36,10 +36,10 @@ try:
 except ImportError:
     _HAS_MLSTM_KERNELS = False
 
-_EPS = 1e-3
+_EPS = 1e-2
 _MLSTM_CHUNK_SIZE = 128
 _BOUNDARY_RESET_LOGF = -1000.0
-_MAX_FORGET_BIAS = 8.0
+_MAX_FORGET_BIAS = 4.0
 
 # Accessible short names for the mlstm_kernels chunkwise triton kernels.
 # The shared "chunkwise--triton" prefix is omitted; see mLSTM.chunkwise_kernel.
@@ -568,6 +568,11 @@ class mLSTM(nn.Module):
             self._init_triton_backend()
 
     def _init_triton_backend(self):
+        # eps=1e-2 bounds the triton kernel's denominator floor (the
+        # default of 1e-6 allows up to 1,000,000x output amplification when
+        # the signed denom_raw sum cancels at high stabilizer m). 1e-2
+        # caps it at 100x, which is manageable for the downstream GroupNorm
+        # without destroying signal at non-outlier positions.
         config = mLSTMBackendConfig(
             chunkwise_kernel=_TRITON_CHUNKWISE_KERNELS[self._chunkwise_kernel],
             sequence_kernel="native_sequence__triton",
@@ -576,6 +581,7 @@ class mLSTM(nn.Module):
             chunk_size=self._chunk_size,
             return_last_states=True,
             autocast_kernel_dtype="float32",
+            eps=_EPS,
         )
         self._mlstm_backend = mLSTMBackend(config=config)
 

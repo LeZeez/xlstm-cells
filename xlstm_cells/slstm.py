@@ -25,10 +25,10 @@ from ._utils import (
     PackedBoundariesMode,
     get_packed_boundaries_override_mode,
 )
+from .mlstm import _MAX_FORGET_BIAS
 
 _EPS = 1e-6
 _BOUNDARY_RESET_LOGF = -1000.0
-_MAX_FORGET_BIAS = 8.0
 
 
 # ---------------------------------------------------------------------------

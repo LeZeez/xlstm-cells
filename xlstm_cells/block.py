@@ -18,7 +18,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional, Tuple
 
-from .mlstm import _MLSTM_CHUNK_SIZE, mLSTM, mLSTMState
+from .mlstm import _MAX_FORGET_BIAS, _MLSTM_CHUNK_SIZE, mLSTM, mLSTMState
 from .slstm import sLSTM, sLSTMState
 
 _GN_EPS = 1e-5
@@ -242,7 +242,7 @@ class mLSTMBlock(nn.Module):
         return self.lstm.init_state(batch_size, device, dtype)
 
     @torch.no_grad()
-    def clamp_forget_bias(self, max_val: float = 8.0) -> None:
+    def clamp_forget_bias(self, max_val: float = _MAX_FORGET_BIAS) -> None:
         """Clamp the inner mLSTM forget-gate bias to [-max_val, max_val].
 
         Call after ``optimizer.step()`` to prevent the forget bias from
@@ -386,7 +386,7 @@ class sLSTMBlock(nn.Module):
         return self.lstm.init_state(batch_size, device, dtype)
 
     @torch.no_grad()
-    def clamp_forget_bias(self, max_val: float = 8.0) -> None:
+    def clamp_forget_bias(self, max_val: float = _MAX_FORGET_BIAS) -> None:
         """Clamp the inner sLSTM forget-gate bias to [-max_val, max_val].
 
         Call after ``optimizer.step()`` to prevent the forget bias from
