@@ -123,6 +123,7 @@ def _mlstm_recurrent_scan(
     C: torch.Tensor,
     n: torch.Tensor,
     m: torch.Tensor,
+    eps: float = _EPS,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Reference implementation for testing only. Not used by any module at runtime.
 
@@ -138,6 +139,7 @@ def _mlstm_recurrent_scan(
         C:        (B, H, Dh, Dh)  initial matrix memory
         n:        (B, H, Dh)     initial normalizer
         m:        (B, H)         initial stabilizer
+        eps:      denominator floor (bounds cancellation amplification)
 
     Returns:
         outputs: (B, T, Hs)  where Hs = H * Dh
@@ -173,7 +175,7 @@ def _mlstm_recurrent_scan(
 
         m_safe = m.clamp_max(0)
         exp_m_safe = torch.exp(m_safe)
-        denom = torch.maximum(qn * exp_m_safe, torch.exp(m_safe - m)).clamp_min(_EPS)
+        denom = torch.maximum(qn * exp_m_safe, torch.exp(m_safe - m)).clamp_min(eps)
         h = ot * ((h_tilde * exp_m_safe[..., None]) / denom[..., None])
         output_list.append(h.reshape(B, hidden_size))
 
@@ -191,6 +193,7 @@ def _mlstm_recurrent_scan_parallel(
     C_init: torch.Tensor,
     n_init: torch.Tensor,
     m_init: torch.Tensor,
+    eps: float = _EPS,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Parallel mLSTM recurrence via numerically stable linear attention.
 
@@ -207,6 +210,10 @@ def _mlstm_recurrent_scan_parallel(
         C_init:   (B, H, Dh, Dh) initial matrix memory
         n_init:   (B, H, Dh)     initial normalizer
         m_init:   (B, H)         initial stabilizer
+        eps:      denominator floor. Bounds the output amplification
+                  (1/eps) in the pathological cancellation regime where
+                  the signed denom_raw sum and the exp-floor both go to
+                  zero. Configurable per layer for training stability.
 
     Returns:
         outputs:  (B, T, Hs)  where Hs = H * Dh
@@ -262,7 +269,7 @@ def _mlstm_recurrent_scan_parallel(
     exp_m_safe = torch.exp(m_safe)
     denom = torch.maximum(
         denom_raw.abs() * exp_m_safe, torch.exp(m_safe - m_attn)
-    ).clamp_min(_EPS)
+    ).clamp_min(eps)
     h = o * ((numerator * exp_m_safe.unsqueeze(-1)) / denom.unsqueeze(-1))
     outputs = h.reshape(B, T, hidden_size)
 
@@ -289,6 +296,7 @@ def _mlstm_recurrent_scan_parallel_chunked(
     n_init: torch.Tensor,
     m_init: torch.Tensor,
     chunk_size: int = _MLSTM_CHUNK_SIZE,
+    eps: float = _EPS,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Chunked parallel mLSTM scan: O(T * chunk_size) memory instead of O(T^2).
 
@@ -302,6 +310,7 @@ def _mlstm_recurrent_scan_parallel_chunked(
         q,k,v,o,i_tilde,log_f:  pre-computed projections (B, T, ...)
         C_init,n_init,m_init:   initial states (user-supplied or zero)
         chunk_size:             steps per parallel scan tile (default 64)
+        eps:                    denominator floor, forwarded to the scan
 
     Returns:
         outputs, C_final, n_final, m_final  (same signatures as the other scans)
@@ -319,6 +328,7 @@ def _mlstm_recurrent_scan_parallel_chunked(
             q[:, start:end], k[:, start:end], v[:, start:end],
             o[:, start:end], i_tilde[:, start:end], log_f[:, start:end],
             C, n, m,
+            eps=eps,
         )
         output_chunks.append(out_chunk)
 
@@ -499,6 +509,7 @@ class mLSTM(nn.Module):
         use_triton_kernels: bool = True,
         chunkwise_kernel: str = "xl_chunk",
         chunk_size: int = _MLSTM_CHUNK_SIZE,
+        eps: Optional[float] = None,
     ):
         super().__init__()
 
@@ -528,6 +539,17 @@ class mLSTM(nn.Module):
         self._chunk_size = chunk_size
         self._chunkwise_kernel = chunkwise_kernel
         self._mlstm_backend = None
+
+        if eps is None:
+            eps = _EPS
+        if (
+            not isinstance(eps, (int, float))
+            or isinstance(eps, bool)
+            or not math.isfinite(eps)
+            or eps <= 0
+        ):
+            raise ValueError("eps must be a positive finite float")
+        self._eps = float(eps)
 
         if chunkwise_kernel not in _TRITON_CHUNKWISE_KERNELS:
             raise ValueError(
@@ -568,11 +590,11 @@ class mLSTM(nn.Module):
             self._init_triton_backend()
 
     def _init_triton_backend(self):
-        # eps=1e-2 bounds the triton kernel's denominator floor (the
-        # default of 1e-6 allows up to 1,000,000x output amplification when
-        # the signed denom_raw sum cancels at high stabilizer m). 1e-2
-        # caps it at 100x, which is manageable for the downstream GroupNorm
-        # without destroying signal at non-outlier positions.
+        # eps bounds the triton kernel's denominator floor. The kernel's
+        # default (1e-6) allows up to 1,000,000x output amplification when
+        # the signed denom_raw sum cancels at high stabilizer m. Passing a
+        # larger eps caps the amplification; the value is configurable per
+        # instance via the eps= constructor arg.
         config = mLSTMBackendConfig(
             chunkwise_kernel=_TRITON_CHUNKWISE_KERNELS[self._chunkwise_kernel],
             sequence_kernel="native_sequence__triton",
@@ -581,7 +603,7 @@ class mLSTM(nn.Module):
             chunk_size=self._chunk_size,
             return_last_states=True,
             autocast_kernel_dtype="float32",
-            eps=_EPS,
+            eps=self._eps,
         )
         self._mlstm_backend = mLSTMBackend(config=config)
 
@@ -748,6 +770,7 @@ class mLSTM(nn.Module):
         return _mlstm_recurrent_scan_parallel_chunked(
             q, k, v, o, i_tilde, log_f, C, n, m,
             chunk_size=self._chunk_size,
+            eps=self._eps,
         )
 
     def _run_layer_kernels(

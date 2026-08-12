@@ -136,6 +136,7 @@ class mLSTMBlock(nn.Module):
         use_triton_kernels: bool = True,
         chunkwise_kernel: str = "xl_chunk",
         chunk_size: int = _MLSTM_CHUNK_SIZE,
+        eps: Optional[float] = None,
     ):
         super().__init__()
         expanded = d_model * expand_factor
@@ -172,6 +173,7 @@ class mLSTMBlock(nn.Module):
             use_triton_kernels=use_triton_kernels,
             chunkwise_kernel=chunkwise_kernel,
             chunk_size=chunk_size,
+            eps=eps,
         )
 
         self.gn = nn.GroupNorm(num_heads, expanded)
