@@ -146,6 +146,37 @@ sLSTMBlock(..., use_checkpoint=True)
 
 Only active during `model.train()`. Combine with TBPTT for maximum memory efficiency.
 
+### Packed sequences without padding pollution (`boundaries`)
+
+Both `mLSTM`/`mLSTMBlock` and `sLSTM`/`sLSTMBlock` accept an optional `boundaries` keyword:
+
+```python
+b = torch.zeros(B, T, dtype=torch.bool, device=x.device)
+b[:, boundary_positions] = True       # True at the FIRST token of every packed doc
+
+out, state = block(x, state, boundaries=b)
+```
+
+`boundaries` is a `(B, T)` bool tensor, `True` at the FIRST position of every packed document (typically `<|BOS|>` markers you insert between concatenated documents). At every `True` position the raw forget gate is forced to `-1000`, killing the cumulative forgetting factor from that position onward in the chunkwise recurrence — equivalent to resetting the recurrent state so the next packed document starts fresh.
+
+This lets you pack multiple short documents into a single `seq_len` window with **zero** padding waste and without the recurrent-state pollution that PAD tokens cause. The model trains on close to 100% of every window instead of ~50% (the typical no-padding skip-short ratio).
+
+When `boundaries=...` and `use_checkpoint=True` both hold, the inner `mLSTM.forward`/`sLSTM.forward` switches to `use_reentrant=True` automatically — required because the override's autograd edge trips PyTorch's `use_reentrant=False` saved-tensor count check. Override this behaviour with `xlstm_cells.set_packed_boundaries_override_mode(PackedBoundariesMode.DISABLE_CKPT_IN_PACKED)` (force `use_checkpoint=False` for any packed call), useful as a fallback on GPUs where re-entrant ckpt interacts badly with the chunkwise kernel.
+
+The override is an approximation, not bit-exact: at boundary positions the carry into the C-state is bounded by `exp(min(0, i_tilde - m_prev + 1000))`, which is below bf16 epsilon for any realistic m-state.
+
+### Forget-bias clamping for high-LR training stability
+
+At aggressive learning rates the forget-gate bias can drift into saturation (`logsigmoid(b_f) ≈ 0`), which makes the log-normalizer `m` grow unboundedly and can silently defeat the boundary reset. All cells, layers, and blocks expose `clamp_forget_bias()` to keep the forget bias in a safe range:
+
+```python
+optimizer.step()
+model.clamp_forget_bias()          # clamp forget bias to [-8.0, 8.0] by default
+model.clamp_forget_bias(max_val=6.0)  # custom bound
+```
+
+Call it after every optimizer step when training at high LR with packed boundaries.
+
 ## TBPTT (Truncated Backpropagation Through Time)
 
 All layers and blocks accept and return state, enabling stateful training over chunks for unlimited context windows on limited hardware:

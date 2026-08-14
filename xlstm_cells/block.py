@@ -18,7 +18,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional, Tuple
 
-from .mlstm import _MLSTM_CHUNK_SIZE, mLSTM, mLSTMState
+from .mlstm import _MAX_FORGET_BIAS, _MLSTM_CHUNK_SIZE, mLSTM, mLSTMState
 from .slstm import sLSTM, sLSTMState
 
 _GN_EPS = 1e-5
@@ -28,14 +28,12 @@ def _group_norm_bhwc(
     x: torch.Tensor, num_groups: int, weight: torch.Tensor,
     bias: torch.Tensor, eps: float = _GN_EPS,
 ) -> torch.Tensor:
-    """GroupNorm working directly on (B, T, C) layout -- no transposes.
+    """Per-token head-wise normalization working directly on (B, T, C) layout -- no transposes.
 
-    Equivalent to ``nn.GroupNorm(groups, C)`` applied to (B, C, T) but
-    operates via reshape so that the tensor stays contiguous.  This eliminates
-    two ``aten::copy_`` calls per block per forward pass.
-
-    Normalisation is computed over (T, D) for each (B, G) where
-    D = C // G, matching the standard GroupNorm semantics.
+    Computes LayerNorm per head (MultiHeadLayerNorm) over the channel
+    dimension D = C // num_groups for each token (b, t) independently,
+    matching the official xLSTM paper semantics and preventing cross-time
+    gradient coupling.
     """
     B, T, C = x.shape
     G = num_groups
@@ -43,8 +41,8 @@ def _group_norm_bhwc(
 
     y = x.reshape(B, T, G, D)
 
-    mean = y.mean(dim=(1, 3), keepdim=True)
-    var = y.var(dim=(1, 3), keepdim=True, unbiased=False)
+    mean = y.mean(dim=-1, keepdim=True)
+    var = y.var(dim=-1, keepdim=True, unbiased=False)
     y = (y - mean) / torch.sqrt(var + eps)
 
     y = y.reshape(B, T, C)
@@ -101,6 +99,7 @@ class mLSTMBlock(nn.Module):
         use_triton_kernels: bool = True,
         chunkwise_kernel: str = "xl_chunk",
         chunk_size: int = _MLSTM_CHUNK_SIZE,
+        eps: Optional[float] = None,
     ):
         super().__init__()
         expanded = d_model * expand_factor
@@ -137,6 +136,7 @@ class mLSTMBlock(nn.Module):
             use_triton_kernels=use_triton_kernels,
             chunkwise_kernel=chunkwise_kernel,
             chunk_size=chunk_size,
+            eps=eps,
         )
 
         self.gn = nn.GroupNorm(num_heads, expanded)
@@ -155,7 +155,18 @@ class mLSTMBlock(nn.Module):
         self,
         x: torch.Tensor,
         state: Optional[mLSTMState] = None,
+        boundaries: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, mLSTMState]:
+        """Run the residual block.
+
+        Args:
+            x: (B, T, d_model) input.
+            state: prior `mLSTMState`; `None` zero-initialises.
+            boundaries: optional (B, T) bool tensor marking the FIRST
+                position of every packed document. Pass-through to the
+                inner ``mLSTM.forward``. See ``mLSTM.forward`` for the
+                math.
+        """
         residual = x
         x = self.ln(x)
 
@@ -172,7 +183,7 @@ class mLSTMBlock(nn.Module):
         h = F.silu(h)                               # Swish activation
         h = h + self.learnable_skip                 # learnable per-channel bias
 
-        h, state = self.lstm(h, state)              # mLSTM recurrence
+        h, state = self.lstm(h, state, boundaries=boundaries)  # mLSTM recurrence
 
         gn_weight = self.gn.weight
         gn_bias = self.gn.bias
@@ -188,6 +199,17 @@ class mLSTMBlock(nn.Module):
 
     def init_state(self, batch_size: int, device=None, dtype=None):
         return self.lstm.init_state(batch_size, device, dtype)
+
+    @torch.no_grad()
+    def clamp_forget_bias(self, max_val: float = _MAX_FORGET_BIAS) -> None:
+        """Clamp the inner mLSTM forget-gate bias to [-max_val, max_val].
+
+        Call after ``optimizer.step()`` to prevent the forget bias from
+        drifting into saturation (logsigmoid(b_f) ≈ 0), which causes
+        the log-normalizer m to grow unboundedly and can make the
+        boundary reset ineffective.
+        """
+        self.lstm.clamp_forget_bias(max_val)
 
 
 class sLSTMBlock(nn.Module):
@@ -276,7 +298,18 @@ class sLSTMBlock(nn.Module):
         self,
         x: torch.Tensor,
         state: Optional[sLSTMState] = None,
+        boundaries: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, sLSTMState]:
+        """Run the residual block.
+
+        Args:
+            x: (B, T, d_model) input.
+            state: prior `sLSTMState`; `None` zero-initialises.
+            boundaries: optional (B, T) bool tensor marking the FIRST
+                position of every packed document. Pass-through to the
+                inner ``sLSTM.forward``. See ``sLSTM.forward`` for the
+                math.
+        """
         residual = x
         x = self.ln(x)
 
@@ -287,7 +320,7 @@ class sLSTMBlock(nn.Module):
             c = c.transpose(1, 2)                  # (B, T, d_model)
             x = x + F.silu(c)                       # additive conv with Swish
 
-        x, state = self.lstm(x, state)              # sLSTM recurrence
+        x, state = self.lstm(x, state, boundaries=boundaries)  # sLSTM recurrence
 
         gn_weight = self.gn.weight
         gn_bias = self.gn.bias
@@ -306,3 +339,14 @@ class sLSTMBlock(nn.Module):
 
     def init_state(self, batch_size: int, device=None, dtype=None):
         return self.lstm.init_state(batch_size, device, dtype)
+
+    @torch.no_grad()
+    def clamp_forget_bias(self, max_val: float = _MAX_FORGET_BIAS) -> None:
+        """Clamp the inner sLSTM forget-gate bias to [-max_val, max_val].
+
+        Call after ``optimizer.step()`` to prevent the forget bias from
+        drifting into saturation (logsigmoid(b_f) ≈ 0), which causes
+        the log-normalizer m to grow unboundedly and can make the
+        boundary reset ineffective.
+        """
+        self.lstm.clamp_forget_bias(max_val)

@@ -1,9 +1,62 @@
-"""State utilities: recursive detach and zero-row for nested state structures."""
+"""State utilities: recursive detach, zero-row, packed-boundaries mode toggle."""
 
 from __future__ import annotations
 
 import torch
-from typing import Any, Dict, List, Tuple, Union
+from enum import Enum
+from typing import Any, Dict, List, Optional, Tuple, Union
+
+
+# ---------------------------------------------------------------------------
+# PackedBoundariesMode -- legacy knob for how (mLSTM/sLSTM).forward
+# boundaries= kwarg interacted with activation checkpointing under packed-
+# document sequences.  USE_REENTRANT_CKPT is now a no-op: the boundaries
+# override is compatible with use_reentrant=False on modern PyTorch, and the
+# non-reentrant path is preferred for detached-input / frozen-embedding
+# TBPTT.  See tests/test_packed_non_reentrant.py.
+# ---------------------------------------------------------------------------
+
+class PackedBoundariesMode(Enum):
+    """How `boundaries=...` interacts with `use_checkpoint=True` (legacy).
+
+    USE_REENTRANT_CKPT (default):
+        Maintained for backwards compatibility.  No longer forces a switch
+        to `use_reentrant=True` -- the runtime uses the non-reentrant path
+        in all cases.
+
+    DISABLE_CKPT_IN_PACKED:
+        When the user passes `boundaries=...`, `use_checkpoint` is silenced
+        (set to False) for the duration of that forward call. Still honoured.
+
+    Default is USE_REENTRANT_CKPT. Set globally via
+    `set_packed_boundaries_override_mode(...)`.
+    """
+    USE_REENTRANT_CKPT = "reentrant"
+    DISABLE_CKPT_IN_PACKED = "disable"
+
+
+_GLOBAL_BOUNDS_MODE: PackedBoundariesMode = PackedBoundariesMode.USE_REENTRANT_CKPT
+
+
+def get_packed_boundaries_override_mode() -> PackedBoundariesMode:
+    return _GLOBAL_BOUNDS_MODE
+
+
+def set_packed_boundaries_override_mode(
+    mode: PackedBoundariesMode,
+) -> PackedBoundariesMode:
+    """Set the global default for how `boundaries=...` interacts with
+    activation checkpointing. Returns the previous mode.
+
+    .. note::
+        Setting this to ``USE_REENTRANT_CKPT`` is a no-op as of the
+        non-reentrant switch. Only ``DISABLE_CKPT_IN_PACKED`` alters
+        runtime behaviour.
+    """
+    global _GLOBAL_BOUNDS_MODE
+    prev = _GLOBAL_BOUNDS_MODE
+    _GLOBAL_BOUNDS_MODE = mode
+    return prev
 
 
 def detach_states(

@@ -22,6 +22,11 @@ from torch.utils.checkpoint import checkpoint as _torch_checkpoint
 import torch.nn as nn
 import torch.nn.functional as F
 
+from ._utils import (
+    PackedBoundariesMode,
+    get_packed_boundaries_override_mode,
+)
+
 try:
     from mlstm_kernels.torch.backend_module import (
         mLSTMBackendConfig,
@@ -31,8 +36,10 @@ try:
 except ImportError:
     _HAS_MLSTM_KERNELS = False
 
-_EPS = 1e-6
+_EPS = 1e-3
 _MLSTM_CHUNK_SIZE = 128
+_BOUNDARY_RESET_LOGF = -1000.0
+_MAX_FORGET_BIAS = 4.0
 
 # Accessible short names for the mlstm_kernels chunkwise triton kernels.
 # The shared "chunkwise--triton" prefix is omitted; see mLSTM.chunkwise_kernel.
@@ -116,6 +123,7 @@ def _mlstm_recurrent_scan(
     C: torch.Tensor,
     n: torch.Tensor,
     m: torch.Tensor,
+    eps: float = _EPS,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Reference implementation for testing only. Not used by any module at runtime.
 
@@ -131,6 +139,7 @@ def _mlstm_recurrent_scan(
         C:        (B, H, Dh, Dh)  initial matrix memory
         n:        (B, H, Dh)     initial normalizer
         m:        (B, H)         initial stabilizer
+        eps:      denominator floor (bounds cancellation amplification)
 
     Returns:
         outputs: (B, T, Hs)  where Hs = H * Dh
@@ -166,7 +175,7 @@ def _mlstm_recurrent_scan(
 
         m_safe = m.clamp_max(0)
         exp_m_safe = torch.exp(m_safe)
-        denom = torch.maximum(qn * exp_m_safe, torch.exp(m_safe - m)).clamp_min(_EPS)
+        denom = torch.maximum(qn * exp_m_safe, torch.exp(m_safe - m)).clamp_min(eps)
         h = ot * ((h_tilde * exp_m_safe[..., None]) / denom[..., None])
         output_list.append(h.reshape(B, hidden_size))
 
@@ -184,6 +193,7 @@ def _mlstm_recurrent_scan_parallel(
     C_init: torch.Tensor,
     n_init: torch.Tensor,
     m_init: torch.Tensor,
+    eps: float = _EPS,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Parallel mLSTM recurrence via numerically stable linear attention.
 
@@ -200,6 +210,10 @@ def _mlstm_recurrent_scan_parallel(
         C_init:   (B, H, Dh, Dh) initial matrix memory
         n_init:   (B, H, Dh)     initial normalizer
         m_init:   (B, H)         initial stabilizer
+        eps:      denominator floor. Bounds the output amplification
+                  (1/eps) in the pathological cancellation regime where
+                  the signed denom_raw sum and the exp-floor both go to
+                  zero. Configurable per layer for training stability.
 
     Returns:
         outputs:  (B, T, Hs)  where Hs = H * Dh
@@ -255,7 +269,7 @@ def _mlstm_recurrent_scan_parallel(
     exp_m_safe = torch.exp(m_safe)
     denom = torch.maximum(
         denom_raw.abs() * exp_m_safe, torch.exp(m_safe - m_attn)
-    ).clamp_min(_EPS)
+    ).clamp_min(eps)
     h = o * ((numerator * exp_m_safe.unsqueeze(-1)) / denom.unsqueeze(-1))
     outputs = h.reshape(B, T, hidden_size)
 
@@ -282,6 +296,7 @@ def _mlstm_recurrent_scan_parallel_chunked(
     n_init: torch.Tensor,
     m_init: torch.Tensor,
     chunk_size: int = _MLSTM_CHUNK_SIZE,
+    eps: float = _EPS,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Chunked parallel mLSTM scan: O(T * chunk_size) memory instead of O(T^2).
 
@@ -295,6 +310,7 @@ def _mlstm_recurrent_scan_parallel_chunked(
         q,k,v,o,i_tilde,log_f:  pre-computed projections (B, T, ...)
         C_init,n_init,m_init:   initial states (user-supplied or zero)
         chunk_size:             steps per parallel scan tile (default 64)
+        eps:                    denominator floor, forwarded to the scan
 
     Returns:
         outputs, C_final, n_final, m_final  (same signatures as the other scans)
@@ -312,6 +328,7 @@ def _mlstm_recurrent_scan_parallel_chunked(
             q[:, start:end], k[:, start:end], v[:, start:end],
             o[:, start:end], i_tilde[:, start:end], log_f[:, start:end],
             C, n, m,
+            eps=eps,
         )
         output_chunks.append(out_chunk)
 
@@ -409,6 +426,19 @@ class mLSTMCell(nn.Module):
 
         return h.reshape(B, self.hidden_size), mLSTMState(C, n, m)
 
+    @torch.no_grad()
+    def clamp_forget_bias(self, max_val: float = _MAX_FORGET_BIAS) -> None:
+        """Clamp the forget-gate bias to [-max_val, max_val].
+
+        Call after ``optimizer.step()`` to prevent the forget bias from
+        drifting into saturation (logsigmoid(b_f) ≈ 0), which causes
+        the log-normalizer m to grow unboundedly and can make the
+        boundary reset ineffective.
+        """
+        NH = self.num_heads
+        if self.W_if.bias is not None:
+            self.W_if.bias.data[NH:].clamp_(-max_val, max_val)
+
 
 # ---------------------------------------------------------------------------
 # mLSTM -- full sequence, multi-layer, bidirectional  (like nn.LSTM)
@@ -479,6 +509,7 @@ class mLSTM(nn.Module):
         use_triton_kernels: bool = True,
         chunkwise_kernel: str = "xl_chunk",
         chunk_size: int = _MLSTM_CHUNK_SIZE,
+        eps: Optional[float] = None,
     ):
         super().__init__()
 
@@ -508,6 +539,17 @@ class mLSTM(nn.Module):
         self._chunk_size = chunk_size
         self._chunkwise_kernel = chunkwise_kernel
         self._mlstm_backend = None
+
+        if eps is None:
+            eps = _EPS
+        if (
+            not isinstance(eps, (int, float))
+            or isinstance(eps, bool)
+            or not math.isfinite(eps)
+            or eps <= 0
+        ):
+            raise ValueError("eps must be a positive finite float")
+        self._eps = float(eps)
 
         if chunkwise_kernel not in _TRITON_CHUNKWISE_KERNELS:
             raise ValueError(
@@ -548,6 +590,11 @@ class mLSTM(nn.Module):
             self._init_triton_backend()
 
     def _init_triton_backend(self):
+        # eps bounds the triton kernel's denominator floor. The kernel's
+        # default (1e-6) allows up to 1,000,000x output amplification when
+        # the signed denom_raw sum cancels at high stabilizer m. Passing a
+        # larger eps caps the amplification; the value is configurable per
+        # instance via the eps= constructor arg.
         config = mLSTMBackendConfig(
             chunkwise_kernel=_TRITON_CHUNKWISE_KERNELS[self._chunkwise_kernel],
             sequence_kernel="native_sequence__triton",
@@ -556,6 +603,7 @@ class mLSTM(nn.Module):
             chunk_size=self._chunk_size,
             return_last_states=True,
             autocast_kernel_dtype="float32",
+            eps=self._eps,
         )
         self._mlstm_backend = mLSTMBackend(config=config)
 
@@ -651,12 +699,13 @@ class mLSTM(nn.Module):
         C: torch.Tensor,
         n: torch.Tensor,
         m: torch.Tensor,
+        boundaries: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         if (self._use_triton_kernels
                 and x.is_cuda
                 and x.size(1) % self._chunk_size == 0
                 and not torch._dynamo.is_compiling()):
-            return self._run_layer_kernels(x, d, layer_idx, C, n, m)
+            return self._run_layer_kernels(x, d, layer_idx, C, n, m, boundaries)
 
         # Warn once if triton was requested but can't be used
         if self._use_triton_kernels:
@@ -690,7 +739,7 @@ class mLSTM(nn.Module):
                 warnings.warn(msg, stacklevel=3)
                 _triton_fallback_warned = True
 
-        return self._run_layer_native(x, d, layer_idx, C, n, m)
+        return self._run_layer_native(x, d, layer_idx, C, n, m, boundaries=boundaries)
 
     def _run_layer_native(
         self,
@@ -700,13 +749,28 @@ class mLSTM(nn.Module):
         C: torch.Tensor,
         n: torch.Tensor,
         m: torch.Tensor,
+        boundaries: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         q, k, v, o, i_tilde, log_f = self._project_sequence(
             x, d, layer_idx, apply_activations=True,
         )
+        if boundaries is not None:
+            # The native scan takes the ALREADY-LOG-SIGMOIDED forget gate;
+            # override `log_f` so the recurrence sees an effectively-zero
+            # cumulative forgetting factor at boundary positions.  The
+            # constant must be large enough that the boundary reset is
+            # unconditional even when the log-normalizer m has drifted
+            # high (e.g. due to saturated forget biases at high LR).
+            # With -1000 the reset holds for any m < i_tilde + 1000,
+            # which covers all realistic scenarios.
+            log_f = log_f.masked_fill(
+                boundaries.to(device=log_f.device, dtype=torch.bool).unsqueeze(-1),
+                _BOUNDARY_RESET_LOGF,
+            )
         return _mlstm_recurrent_scan_parallel_chunked(
             q, k, v, o, i_tilde, log_f, C, n, m,
             chunk_size=self._chunk_size,
+            eps=self._eps,
         )
 
     def _run_layer_kernels(
@@ -717,6 +781,7 @@ class mLSTM(nn.Module):
         C: torch.Tensor,
         n: torch.Tensor,
         m: torch.Tensor,
+        boundaries: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         Hh = self.num_heads[layer_idx]
         Dh = self.hidden_size // Hh
@@ -734,6 +799,17 @@ class mLSTM(nn.Module):
         # both paths produce identical outputs and interchangeable states
         # (TBPTT can mix kernel and native segments freely).
         k = k * sf
+
+        # Pack-aware state reset: override f_tilde at boundary positions
+        # so logsigmoid(f_tilde) ≈ _BOUNDARY_RESET_LOGF contributes a
+        # near-zero cumulative forgetting factor to the chunkwise
+        # recurrence at those positions.  The constant is large enough
+        # to guarantee an unconditional reset even when the log-normalizer
+        # m has drifted high (e.g. due to saturated forget biases at
+        # high LR).  See PACKED_FORGET_RESET_RESULTS.md for the math.
+        if boundaries is not None:
+            b = boundaries.to(device=f_tilde.device, dtype=torch.bool).unsqueeze(-1)
+            f_tilde = f_tilde.masked_fill(b, _BOUNDARY_RESET_LOGF)
 
         # Permute (B,T,H,Dh) -> (B,H,T,Dh) for triton kernels.
         # Individual permute+contiguous avoids the intermediate stacked tensor
@@ -768,7 +844,24 @@ class mLSTM(nn.Module):
         self,
         input: torch.Tensor,
         state=None,
+        boundaries: Optional[torch.Tensor] = None,
     ):
+        """Run mLSTM recurrence over `input`.
+
+        Args:
+            input: (B, T, input_size) when batch_first=True.
+            state: prior `mLSTMState`(s); `None` initialises at zero.
+            boundaries: optional bool tensor of shape (B, T) marking the
+                FIRST position of every packed document. At those
+                positions the raw forget-gate is forced to
+                _BOUNDARY_RESET_LOGF (-1000), killing the cumulative
+                carry into the chunkwise recurrence from that point
+                onward (effectively resetting the recurrent state).
+                Enables sequence packing without padding pollution.
+
+        See ``PACKED_FORGET_RESET_RESULTS.md`` for the math and the
+        interplay with activation checkpointing.
+        """
         if not self.batch_first:
             input = input.transpose(0, 1)
 
@@ -779,6 +872,21 @@ class mLSTM(nn.Module):
 
         if not isinstance(state, tuple):
             state = (state,)
+
+        # When the user passes `boundaries`, decide how to interact with
+        # activation checkpointing globally. The chosen mode lives in
+        # xlstm_cells._utils.PackedBoundariesMode.
+        packed = boundaries is not None
+        bounds_mode = get_packed_boundaries_override_mode()
+        ckpt_active = bool(self.use_checkpoint and self.training)
+        if packed and bounds_mode == PackedBoundariesMode.DISABLE_CKPT_IN_PACKED:
+            ckpt_active = False
+        ckpt_use_reentrant = False
+        # PackedBoundariesMode.USE_REENTRANT_CKPT is no longer applied; the
+        # boundaries override is compatible with use_reentrant=False on modern
+        # PyTorch, and non-reentrant is more robust under detached-input /
+        # frozen-embedding TBPTT (same VRAM envelope, no silent grad loss).
+        # See tests/test_packed_non_reentrant.py.
 
         # Pre-allocate output state buffers (one per layer) to avoid
         # creating new tensors per layer per forward pass.  These are fresh
@@ -805,14 +913,16 @@ class mLSTM(nn.Module):
                 n_dl = s_l.n.squeeze(0)
                 m_dl = s_l.m.squeeze(0)
 
-                if self.use_checkpoint and self.training:
+                if ckpt_active:
                     out, C_out, n_out, m_out = _torch_checkpoint(
-                        self._run_layer, layer_input, 0, layer_idx, C_dl, n_dl, m_dl,
-                        use_reentrant=False,
+                        self._run_layer, layer_input, 0, layer_idx,
+                        C_dl, n_dl, m_dl, boundaries,
+                        use_reentrant=ckpt_use_reentrant,
                     )
                 else:
                     out, C_out, n_out, m_out = self._run_layer(
                         layer_input, 0, layer_idx, C_dl, n_dl, m_dl,
+                        boundaries=boundaries,
                     )
 
                 layer_output = out
@@ -826,18 +936,32 @@ class mLSTM(nn.Module):
                     if d == 1:
                         layer_input = torch.flip(layer_input, [1])
 
+                    # Direction-local boundary: in the reverse direction
+                    # (d == 1) the input has been flipped, so position j in
+                    # the flipped stream corresponds to original position
+                    # (T-1-j). The boundary mask must flip with the input
+                    # so a boundary at original position p triggers the
+                    # forget-gate override at flipped position (T-1-p)
+                    # -- which is where the reverse recurrence is
+                    # processing original token p.
+                    b_d = boundaries
+                    if d == 1 and boundaries is not None:
+                        b_d = torch.flip(boundaries, [1])
+
                     C_dl = s_l.C[d]
                     n_dl = s_l.n[d]
                     m_dl = s_l.m[d]
 
-                    if self.use_checkpoint and self.training:
+                    if ckpt_active:
                         out, C_out, n_out, m_out = _torch_checkpoint(
-                            self._run_layer, layer_input, d, layer_idx, C_dl, n_dl, m_dl,
-                            use_reentrant=False,
+                            self._run_layer, layer_input, d, layer_idx,
+                            C_dl, n_dl, m_dl, b_d,
+                            use_reentrant=ckpt_use_reentrant,
                         )
                     else:
                         out, C_out, n_out, m_out = self._run_layer(
                             layer_input, d, layer_idx, C_dl, n_dl, m_dl,
+                            boundaries=b_d,
                         )
 
                     if d == 1:
@@ -865,6 +989,22 @@ class mLSTM(nn.Module):
 
     def flatten_parameters(self) -> None:
         pass
+
+    @torch.no_grad()
+    def clamp_forget_bias(self, max_val: float = _MAX_FORGET_BIAS) -> None:
+        """Clamp the forget-gate bias to [-max_val, max_val] across all layers.
+
+        Call after ``optimizer.step()`` to prevent the forget bias from
+        drifting into saturation (logsigmoid(b_f) ≈ 0), which causes
+        the log-normalizer m to grow unboundedly and can make the
+        boundary reset ineffective.
+        """
+        for d in range(self.num_directions):
+            for layer_idx in range(self.num_layers):
+                Hh = self.num_heads[layer_idx]
+                W_if = getattr(self, f"W_if_{d}_{layer_idx}")
+                if W_if.bias is not None:
+                    W_if.bias.data[Hh:].clamp_(-max_val, max_val)
 
     def __repr__(self) -> str:
         return (
