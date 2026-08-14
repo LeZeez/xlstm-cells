@@ -55,41 +55,6 @@ def _group_norm_bhwc(
     return y
 
 
-def _segment_aware_pre_conv(
-    h: torch.Tensor,
-    boundaries: Optional[torch.Tensor],
-    K_m1: int,
-) -> torch.Tensor:
-    """Zero the K_m1 input positions immediately preceding each True
-    in `boundaries`, before a depthwise causal Conv1d runs.  Ensures
-    the boundary token's conv receptive field contains no
-    cross-document context (its kernel sees ``[0, 0, 0, h[boundary]]``,
-    not the prior-document tail).
-
-    For a boundary at position p, the K_m1 positions ``[p-K_m1, p)``
-    become zero.  Positions ``[p+1, p+K_m1)`` then see partially-zeroed
-    receptive fields that converge to fully-clean by position ``p+K_m1``,
-    matching the natural K-step warmup that depthwise causal convolution
-    applies to any sequence start.
-
-    Returns `h` unchanged when `boundaries is None`, ``K_m1 <= 0``, or
-    ``T == 0``.
-
-    Handles boundaries at/near the sequence end (p > T-K_m1): the
-    right-padded boundary mask produces windows for every start i in
-    [0, T), so a doc ending at T-1 no longer leaks its tail into the
-    conv kernel.  See tests/test_segment_aware_pre_conv.py.
-    """
-    if boundaries is None or K_m1 <= 0:
-        return h
-    B, T, _ = h.shape
-    if T == 0:
-        return h
-    b_pad = F.pad(boundaries, (0, K_m1), value=False)
-    fresh = b_pad.unfold(1, K_m1 + 1, 1)[:, :, 1:].any(dim=-1)
-    return h.masked_fill(fresh.unsqueeze(-1), 0.0)
-
-
 class mLSTMBlock(nn.Module):
     """Paper-compliant mLSTM block with pre up-projection.
 
@@ -212,12 +177,6 @@ class mLSTMBlock(nn.Module):
         gate = torch.sigmoid(gate_raw)
 
         if self.conv is not None:
-            # Segment-aware conv: zero the K-1 input slots right before
-            # each packed-document boundary so the boundary token's causal
-            # convolution receptive field contains no prior-document context
-            # (the recurrent state is also reset by the boundaries kwarg on
-            # self.lstm). See ``_segment_aware_pre_conv``.
-            h = _segment_aware_pre_conv(h, boundaries, self.conv_kernel - 1)
             h = h.transpose(1, 2)                  # (B, expanded, T) for Conv1d
             h = F.pad(h, (self.conv_kernel - 1, 0))  # causal: pad left only
             h = self.conv(h)                       # (B, expanded, T)
@@ -357,10 +316,6 @@ class sLSTMBlock(nn.Module):
         x = self.ln(x)
 
         if self.conv is not None:
-            # Segment-aware conv: see ``_segment_aware_pre_conv`` in
-            # mLSTMBlock. Same logic, applied to sLSTM's additive-conv
-            # stack so the boundary token's receptive field is clean.
-            x = _segment_aware_pre_conv(x, boundaries, self.conv_kernel - 1)
             c = x.transpose(1, 2)                  # (B, d_model, T)
             c = F.pad(c, (self.conv_kernel - 1, 0))
             c = self.conv(c)

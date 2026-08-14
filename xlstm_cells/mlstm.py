@@ -36,7 +36,7 @@ try:
 except ImportError:
     _HAS_MLSTM_KERNELS = False
 
-_EPS = 1e-2
+_EPS = 1e-3
 _MLSTM_CHUNK_SIZE = 128
 _BOUNDARY_RESET_LOGF = -1000.0
 _MAX_FORGET_BIAS = 4.0
