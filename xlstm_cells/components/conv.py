@@ -1,5 +1,7 @@
 # Copyright (c) NXAI GmbH and its affiliates 2024
 # Maximilian Beck, Korbinian Pöppel
+"""Causal 1D depthwise convolution module for local context mixing."""
+
 from typing import Optional, Tuple
 import torch
 from torch import nn
@@ -33,9 +35,13 @@ def conv1d_step(
 
 
 class CausalConv1d(nn.Module):
-    """Causal depthwise 1D convolution with left-padding.
-    Input:  (B, T, D)
-    Output: (B, T, D)
+    """Causal depthwise 1D convolution with left-padding for sequence modeling.
+
+    Args:
+        feature_dim: Number of input and output channels.
+        kernel_size: Size of the 1D convolution kernel. Default: 4.
+        bias: Whether to add a learnable bias. Default: True.
+        channel_mixing: If True, uses groups=1; if False, uses groups=feature_dim (depthwise). Default: False.
     """
 
     def __init__(
@@ -45,6 +51,7 @@ class CausalConv1d(nn.Module):
         bias: bool = True,
         channel_mixing: bool = False,
     ):
+        """Initializes CausalConv1d with depthwise 1D convolution."""
         super().__init__()
         self.feature_dim = feature_dim
         self.kernel_size = kernel_size
@@ -65,7 +72,8 @@ class CausalConv1d(nn.Module):
 
         self.reset_parameters()
 
-    def reset_parameters(self):
+    def reset_parameters(self) -> None:
+        """Resets convolution parameters."""
         if self.conv is not None:
             self.conv.reset_parameters()
 
@@ -75,29 +83,46 @@ class CausalConv1d(nn.Module):
         conv_state: Optional[torch.Tensor] = None,
         return_last_state: bool = False,
     ) -> torch.Tensor | Tuple[torch.Tensor, torch.Tensor]:
-        if self.conv is None:
+        """Forward pass of causal 1D depthwise convolution.
+
+        Args:
+            x: Input tensor of shape (B, T, D).
+            conv_state: Optional left context tensor of shape (B, KS-1, D).
+            return_last_state: If True, returns (output, next_conv_state).
+
+        Returns:
+            Output tensor of shape (B, T, D), or (output, next_conv_state).
+        """
+        if self.conv is None or self.kernel_size == 0:
             return (x, None) if return_last_state else x
 
-        B, T, D = x.shape
-        x_in = x.transpose(1, 2)  # (B, D, T)
-        out = self.conv(x_in)
-        out = out[:, :, :T].transpose(1, 2)  # (B, T, D)
+        if conv_state is not None:
+            x = torch.cat([conv_state, x], dim=1)
+
+        y = x.transpose(2, 1)  # (B, D, T)
+        y = self.conv(y)
+        if conv_state is not None:
+            y = y[:, :, conv_state.shape[1] :]
 
         if return_last_state:
-            # Extract last KS tokens for stateful continuation
-            last_k = min(self.kernel_size, T)
-            new_conv_state = x[:, -last_k:, :]
-            if last_k < self.kernel_size:
-                pad_needed = self.kernel_size - last_k
-                new_conv_state = F.pad(new_conv_state, (0, 0, pad_needed, 0))
-            return out, new_conv_state
-        return out
+            return y[:, :, : -self.pad].transpose(2, 1), x[:, -self.pad :]
+        else:
+            return y[:, :, : -self.pad].transpose(2, 1)
 
     def step(
         self,
         x: torch.Tensor,
         conv_state: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Single-step causal convolution for autoregressive generation.
+
+        Args:
+            x: Input token tensor of shape (B, 1, D).
+            conv_state: Previous state buffer of shape (B, KS, D).
+
+        Returns:
+            Tuple of (output token tensor of shape (B, 1, D), updated conv_state).
+        """
         if self.conv is None:
             return x, None
         B, S, D = x.shape

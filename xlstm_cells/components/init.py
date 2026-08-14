@@ -1,5 +1,7 @@
 # Copyright (c) NXAI GmbH and its affiliates 2024
 # Maximilian Beck
+"""Weight initialization routines for xLSTM blocks and projections."""
+
 import math
 import torch
 

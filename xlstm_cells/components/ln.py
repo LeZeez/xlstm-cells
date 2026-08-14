@@ -1,12 +1,24 @@
 # Copyright (c) NXAI GmbH and its affiliates 2024
 # Maximilian Beck, Korbinian Pöppel
+"""Layer normalization and multi-head layer normalization modules."""
+
+from typing import Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 
 class LayerNorm(nn.Module):
-    """LayerNorm with optional bias and optional residual weight."""
+    """Layer Normalization with optional residual weight parametrization.
+
+    Args:
+        ndim: Dimensionality of the normalized shape.
+        weight: Whether to include learnable affine weight parameter. Default: True.
+        bias: Whether to include learnable affine bias parameter. Default: False.
+        eps: Small constant added to denominator for numerical stability. Default: 1e-5.
+        residual_weight: If True, uses residual weight parametrization (1 + weight),
+            initialized to zero. Default: True.
+    """
 
     def __init__(
         self,
@@ -16,6 +28,7 @@ class LayerNorm(nn.Module):
         eps: float = 1e-5,
         residual_weight: bool = True,
     ):
+        """Initializes LayerNorm with optional residual weighting."""
         super().__init__()
         self.weight = nn.Parameter(torch.zeros(ndim)) if weight else None
         self.bias = nn.Parameter(torch.zeros(ndim)) if bias else None
@@ -25,7 +38,8 @@ class LayerNorm(nn.Module):
         self.reset_parameters()
 
     @property
-    def weight_proxy(self) -> torch.Tensor:
+    def weight_proxy(self) -> Optional[torch.Tensor]:
+        """Returns the effective weight tensor taking residual parametrization into account."""
         if self.weight is None:
             return None
         if self.residual_weight:
@@ -34,11 +48,20 @@ class LayerNorm(nn.Module):
             return self.weight
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
+        """Applies layer normalization over the last dimension.
+
+        Args:
+            input: Input tensor of shape (*, ndim).
+
+        Returns:
+            Normalized tensor of same shape as input.
+        """
         return F.layer_norm(
             input, normalized_shape=(self.ndim,), weight=self.weight_proxy, bias=self.bias, eps=self.eps
         )
 
-    def reset_parameters(self):
+    def reset_parameters(self) -> None:
+        """Resets learnable parameters to their initial values."""
         if self.weight is not None:
             if self.residual_weight:
                 nn.init.zeros_(self.weight)
@@ -56,7 +79,16 @@ class MultiHeadLayerNorm(LayerNorm):
     Supports both 4D (B, NH, S, DH) and 3D (B, S, C) layouts.
     """
 
-    def forward(self, input: torch.Tensor, num_heads: int = None) -> torch.Tensor:
+    def forward(self, input: torch.Tensor, num_heads: Optional[int] = None) -> torch.Tensor:
+        """Applies multi-head layer normalization per token across head channels.
+
+        Args:
+            input: Input tensor of shape (B, NH, S, DH) or (B, S, C).
+            num_heads: Number of attention/recurrent heads (required for 3D inputs).
+
+        Returns:
+            Normalized tensor matching the input shape.
+        """
         if input.dim() == 4:
             B, NH, S, DH = input.shape
             gn_in_1 = input.transpose(1, 2)  # (B, S, NH, DH)

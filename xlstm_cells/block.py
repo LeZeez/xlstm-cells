@@ -58,7 +58,22 @@ _TRITON_CHUNKWISE_KERNELS = {
 # ---------------------------------------------------------------------------
 
 class mLSTMBlock(nn.Module):
-    """Paper-compliant mLSTM block with pre up-projection (Figure 11)."""
+    """Paper-compliant mLSTM block with pre up-projection (Figure 11).
+
+    Args:
+        d_model: Model hidden dimension.
+        expand_factor: Expansion factor for inner projection (expanded = d_model * expand_factor). Default: 2.
+        num_heads: Number of parallel matrix-memory heads. Default: 4.
+        conv_kernel: 1D causal convolution kernel size. 0 disables convolution. Default: 4.
+        dropout: Output dropout probability. Default: 0.0.
+        bias: Whether linear projection layers use bias. Default: False.
+        use_checkpoint: Whether to apply activation checkpointing. Default: False.
+        use_triton_kernels: Whether to use mlstm_kernels Triton backend when available. Default: True.
+        chunkwise_kernel: Triton chunk kernel name ("limit_chunk" or "xl_chunk"). Default: "xl_chunk".
+        chunk_size: Sequence chunk size for chunked scan. Default: 128.
+        eps: Denominator epsilon constant for stabilizer numerical stability. Default: 1e-3.
+        num_blocks: Total number of stacked blocks in the model (for Wang init scaling). Default: 1.
+    """
 
     def __init__(
         self,
@@ -75,6 +90,7 @@ class mLSTMBlock(nn.Module):
         eps: Optional[float] = None,
         num_blocks: int = 1,
     ):
+        """Initializes paper-compliant mLSTMBlock."""
         super().__init__()
         expanded = d_model * expand_factor
         assert expanded % num_heads == 0, f"expanded ({expanded}) must be divisible by num_heads ({num_heads})"
@@ -116,7 +132,8 @@ class mLSTMBlock(nn.Module):
 
         self.reset_parameters(num_blocks=num_blocks)
 
-    def _init_triton_backend(self):
+    def _init_triton_backend(self) -> None:
+        """Initializes Triton kernel backend configuration."""
         config = mLSTMBackendConfig(
             chunkwise_kernel=_TRITON_CHUNKWISE_KERNELS[self._chunkwise_kernel],
             sequence_kernel="native_sequence__triton",
@@ -128,7 +145,8 @@ class mLSTMBlock(nn.Module):
         )
         self._mlstm_backend = mLSTMBackend(config=config)
 
-    def reset_parameters(self, num_blocks: int = 1):
+    def reset_parameters(self, num_blocks: int = 1) -> None:
+        """Initializes weights using official paper init schemes."""
         small_init_init_(self.fused_proj.weight, dim=self.d_model)
         if self.fused_proj.bias is not None: nn.init.zeros_(self.fused_proj.bias)
 
@@ -155,6 +173,7 @@ class mLSTMBlock(nn.Module):
             self.conv.reset_parameters()
 
     def init_state(self, batch_size: int, device=None, dtype=None) -> mLSTMState:
+        """Initializes zero state object for mLSTM recurrence."""
         return mLSTMState.init(batch_size, self.num_heads, self.head_dim, device, dtype)
 
     def _run_core_native(
@@ -169,6 +188,7 @@ class mLSTMBlock(nn.Module):
         m: torch.Tensor,
         boundaries: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Executes native PyTorch parallel chunked scan."""
         from .mlstm import _mlstm_recurrent_scan_parallel_chunked
         log_f = F.logsigmoid(f_raw)
         if boundaries is not None:
@@ -192,6 +212,7 @@ class mLSTMBlock(nn.Module):
         m: torch.Tensor,
         boundaries: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Executes official Triton mLSTM kernel."""
         B, T, H, Dh = q.shape
         sf = math.sqrt(Dh)
         k_scaled = k * sf
@@ -227,6 +248,16 @@ class mLSTMBlock(nn.Module):
         state: Optional[mLSTMState] = None,
         boundaries: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, mLSTMState]:
+        """Forward pass through the mLSTM block.
+
+        Args:
+            x: Input tensor of shape (B, T, d_model).
+            state: Optional previous mLSTMState. If None, initialized to zeros.
+            boundaries: Optional boolean mask of shape (B, T) indicating document start boundaries.
+
+        Returns:
+            Tuple of (output_tensor, new_state).
+        """
         B, T, _ = x.shape
         residual = x
 
@@ -293,6 +324,7 @@ class mLSTMBlock(nn.Module):
 
     @torch.no_grad()
     def clamp_forget_bias(self, max_val: float = _MAX_FORGET_BIAS) -> None:
+        """Clamps forget gate bias to prevent numerical saturation."""
         if self.fgate.bias is not None:
             self.fgate.bias.data.clamp_(-max_val, max_val)
 
@@ -302,7 +334,21 @@ class mLSTMBlock(nn.Module):
 # ---------------------------------------------------------------------------
 
 class sLSTMBlock(nn.Module):
-    """Paper-compliant sLSTM block with post up-projection (Figure 10)."""
+    """Paper-compliant sLSTM block with post up-projection (Figure 10).
+
+    Args:
+        d_model: Model hidden dimension.
+        num_heads: Number of scalar-memory heads. Default: 4.
+        conv_kernel: 1D causal convolution kernel size. 0 disables convolution. Default: 4.
+        mlp_factor: Multiplier for feedforward hidden dimension. Default: 4.0 / 3.0.
+        dropout: Output dropout probability. Default: 0.0.
+        bias: Whether linear projection layers use bias. Default: True.
+        backend: sLSTM backend ("vanilla" or "cuda"). Default: "vanilla".
+        use_checkpoint: Whether to apply activation checkpointing. Default: False.
+        fast_mode: Whether to use compiled chunking for vanilla backend. Default: False.
+        fast_chunk_size: Chunk size for fast_mode compilation. Default: 32.
+        num_blocks: Total number of stacked blocks in the model. Default: 1.
+    """
 
     def __init__(
         self,
@@ -318,6 +364,7 @@ class sLSTMBlock(nn.Module):
         fast_chunk_size: int = 32,
         num_blocks: int = 1,
     ):
+        """Initializes paper-compliant sLSTMBlock."""
         super().__init__()
         assert d_model % num_heads == 0, f"d_model ({d_model}) must be divisible by num_heads ({num_heads})"
         self.d_model = d_model
@@ -360,7 +407,8 @@ class sLSTMBlock(nn.Module):
 
         self.reset_parameters()
 
-    def reset_parameters(self):
+    def reset_parameters(self) -> None:
+        """Resets all block layer parameters."""
         self.ln.reset_parameters()
         if self.conv is not None:
             self.conv.reset_parameters()
@@ -370,6 +418,7 @@ class sLSTMBlock(nn.Module):
         self.ffn.reset_parameters()
 
     def init_state(self, batch_size: int, device=None, dtype=None) -> sLSTMState:
+        """Initializes zero state object for sLSTM recurrence."""
         return self.lstm.init_state(batch_size, device, dtype)
 
     def forward(
@@ -378,6 +427,16 @@ class sLSTMBlock(nn.Module):
         state: Optional[sLSTMState] = None,
         boundaries: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, sLSTMState]:
+        """Forward pass through the sLSTM block.
+
+        Args:
+            x: Input tensor of shape (B, T, d_model).
+            state: Optional previous sLSTMState. If None, initialized to zeros.
+            boundaries: Optional boolean mask of shape (B, T) indicating document start boundaries.
+
+        Returns:
+            Tuple of (output_tensor, new_state).
+        """
         residual = x
         x_norm = self.ln(x)
 
@@ -400,4 +459,5 @@ class sLSTMBlock(nn.Module):
 
     @torch.no_grad()
     def clamp_forget_bias(self, max_val: float = _MAX_FORGET_BIAS) -> None:
+        """Clamps forget gate bias to prevent numerical saturation."""
         self.lstm.clamp_forget_bias(max_val)

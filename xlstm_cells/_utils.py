@@ -39,6 +39,7 @@ _GLOBAL_BOUNDS_MODE: PackedBoundariesMode = PackedBoundariesMode.USE_REENTRANT_C
 
 
 def get_packed_boundaries_override_mode() -> PackedBoundariesMode:
+    """Returns the current global packed boundaries override mode."""
     return _GLOBAL_BOUNDS_MODE
 
 

@@ -61,6 +61,7 @@ class sLSTMState:
     @classmethod
     def init(cls, batch_size: int, num_heads: int, head_dim: int,
              device=None, dtype=None) -> "sLSTMState":
+        """Initializes zero state tensors for sLSTM."""
         H, Dh = num_heads, head_dim
         return cls(
             c=torch.zeros(batch_size, H, Dh, device=device, dtype=dtype),
@@ -70,14 +71,17 @@ class sLSTMState:
         )
 
     def detach(self) -> "sLSTMState":
+        """Detaches state tensors from the autograd graph."""
         return sLSTMState(self.c.detach(), self.n.detach(),
                           self.m.detach(), self.h.detach())
 
     def to(self, *args, **kwargs) -> "sLSTMState":
+        """Moves state tensors to specified device or dtype."""
         return sLSTMState(self.c.to(*args, **kwargs), self.n.to(*args, **kwargs),
                           self.m.to(*args, **kwargs), self.h.to(*args, **kwargs))
 
     def clone(self) -> "sLSTMState":
+        """Returns a cloned copy of the state object."""
         return sLSTMState(self.c.clone(), self.n.clone(),
                           self.m.clone(), self.h.clone())
 
@@ -151,10 +155,18 @@ def _slstm_recurrent_scan(
 # ---------------------------------------------------------------------------
 
 class sLSTMCell(nn.Module):
-    """One time-step of sLSTM."""
+    """Single time-step scalar-memory LSTM (sLSTM) cell.
+
+    Args:
+        input_size: Input feature dimension.
+        hidden_size: Hidden feature dimension (must be divisible by num_heads).
+        num_heads: Number of scalar memory heads. Default: 4.
+        bias: Whether to include learnable input and gate biases. Default: True.
+    """
 
     def __init__(self, input_size: int, hidden_size: int, num_heads: int = 4,
                  bias: bool = True):
+        """Initializes single-step sLSTMCell."""
         super().__init__()
         assert hidden_size % num_heads == 0
         self.input_size = input_size
@@ -169,6 +181,7 @@ class sLSTMCell(nn.Module):
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
+        """Initializes weights using official paper init schemes."""
         Dh = self.head_dim
         HS = self.hidden_size
         NH = self.num_heads
@@ -193,9 +206,19 @@ class sLSTMCell(nn.Module):
                 R[h, :, g*Dh:(g+1)*Dh] = tmp
 
     def init_state(self, batch_size: int, device=None, dtype=None) -> sLSTMState:
+        """Initializes zero state for one step of sLSTM."""
         return sLSTMState.init(batch_size, self.num_heads, self.head_dim, device, dtype)
 
     def forward(self, x_t: torch.Tensor, state: sLSTMState) -> Tuple[torch.Tensor, sLSTMState]:
+        """Runs a single recurrent time-step.
+
+        Args:
+            x_t: Input tensor of shape (B, input_size).
+            state: Previous sLSTMState.
+
+        Returns:
+            Tuple of (output tensor of shape (B, hidden_size), new_state).
+        """
         B = x_t.size(0)
         H, Dh = self.num_heads, self.head_dim
 
@@ -219,6 +242,7 @@ class sLSTMCell(nn.Module):
 
     @torch.no_grad()
     def clamp_forget_bias(self, max_val: float = _MAX_FORGET_BIAS) -> None:
+        """Clamps forget gate bias to prevent numerical saturation."""
         HS = self.hidden_size
         if self.W_all.bias is not None:
             self.W_all.bias.data[2*HS:3*HS].clamp_(-max_val, max_val)
@@ -229,7 +253,26 @@ class sLSTMCell(nn.Module):
 # ---------------------------------------------------------------------------
 
 class sLSTM(nn.Module):
-    """Multi-layer sLSTM supporting vanilla compiled scan and CUDA kernels."""
+    """Multi-layer Scalar LSTM (sLSTM) sequence model.
+
+    Implements official xLSTM scalar memory recurrence with exponential gating,
+    supporting vanilla sequential/compiled chunked scan and optional official CUDA backend.
+
+    Args:
+        input_size: Input feature dimension.
+        hidden_size: Hidden feature dimension (must be divisible by num_heads).
+        num_layers: Number of stacked sLSTM layers. Default: 1.
+        num_heads: Number of scalar memory heads per layer. Default: 4.
+        bias: Whether to include learnable input and gate biases. Default: True.
+        batch_first: If True, inputs/outputs have shape (B, T, D); otherwise (T, B, D). Default: True.
+        dropout: Dropout applied between stacked layers. Default: 0.0.
+        bidirectional: If True, processes sequence in both forward and backward directions. Default: False.
+        pack_state: If True, returns states as a tuple across layers. Default: True.
+        backend: Recurrence backend ("vanilla" or "cuda"). Default: "vanilla".
+        use_checkpoint: Whether to use gradient activation checkpointing. Default: False.
+        fast_mode: Whether to use compiled chunking for vanilla backend. Default: False.
+        fast_chunk_size: Chunk size for fast_mode compilation. Default: 32.
+    """
 
     def __init__(
         self,
@@ -247,6 +290,7 @@ class sLSTM(nn.Module):
         fast_mode: bool = False,
         fast_chunk_size: int = 32,
     ):
+        """Initializes multi-layer sLSTM sequence model."""
         super().__init__()
         assert hidden_size % num_heads == 0
 
@@ -297,11 +341,12 @@ class sLSTM(nn.Module):
         self._compiled_scans = {}
         self.reset_parameters()
 
-    def flatten_parameters(self):
+    def flatten_parameters(self) -> None:
         """No-op for nn.LSTM compatibility."""
         pass
 
-    def _init_cuda_backend(self):
+    def _init_cuda_backend(self) -> None:
+        """Compiles and loads the official sLSTM CUDA C++ extension."""
         try:
             from .cuda.cuda_init import load
             curdir = os.path.dirname(__file__)
@@ -320,7 +365,8 @@ class sLSTM(nn.Module):
             warnings.warn(f"sLSTM: failed to compile CUDA kernel ({e}). Falling back to backend='vanilla'.")
             self.backend = "vanilla"
 
-    def reset_parameters(self):
+    def reset_parameters(self) -> None:
+        """Initializes weights using official paper init schemes."""
         for layer_idx in range(self.num_layers):
             Hh = self.num_heads[layer_idx]
             Dh = self.hidden_size // Hh
@@ -350,6 +396,7 @@ class sLSTM(nn.Module):
                         R[h, :, g*Dh:(g+1)*Dh] = tmp
 
     def init_state(self, batch_size: int, device=None, dtype=None) -> Union[sLSTMState, Tuple[sLSTMState, ...]]:
+        """Initializes zero state structures for all layers."""
         states = []
         for layer_idx in range(self.num_layers):
             Hh = self.num_heads[layer_idx]
@@ -364,8 +411,10 @@ class sLSTM(nn.Module):
         return tuple(states) if self.pack_state else (states[0] if self.num_layers == 1 else tuple(states))
 
     def _get_compiled_scan(self, chunk_size: int):
+        """Returns or compiles torch.compile scan kernel for the specified chunk size."""
         if chunk_size not in self._compiled_scans:
             def scan_chunk(all_in, R, c, n, m, h, b=None):
+                """Scans a single sequence chunk with torch.compile."""
                 return _slstm_scan_sequential(all_in, R, c, n, m, h, b)
             self._compiled_scans[chunk_size] = torch.compile(scan_chunk, dynamic=False)
         return self._compiled_scans[chunk_size]
@@ -381,6 +430,7 @@ class sLSTM(nn.Module):
         h: torch.Tensor,
         boundaries: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Runs sLSTM layer recurrence using the vanilla PyTorch scan backend."""
         B, T, _ = x.shape
         Hh = self.num_heads[layer_idx]
         Dh = self.hidden_size // Hh
@@ -422,6 +472,16 @@ class sLSTM(nn.Module):
         state=None,
         boundaries: Optional[torch.Tensor] = None,
     ):
+        """Forward pass through the multi-layer sLSTM model.
+
+        Args:
+            input: Input tensor of shape (B, T, D) if batch_first else (T, B, D).
+            state: Optional previous state (sLSTMState or tuple of states per layer).
+            boundaries: Optional boolean mask of shape (B, T) indicating document start boundaries.
+
+        Returns:
+            Tuple of (output tensor, final state).
+        """
         if not self.batch_first:
             input = input.transpose(0, 1)
 
@@ -488,7 +548,12 @@ class sLSTM(nn.Module):
                 dir_outputs: List[torch.Tensor] = []
                 for d in range(self.num_directions):
                     l_in = torch.flip(layer_input, [1]) if d == 1 else layer_input
-                    b_d = torch.flip(boundaries, [1]) if (d == 1 and boundaries is not None) else boundaries
+                    if d == 1 and boundaries is not None:
+                        b_flipped = torch.flip(boundaries, [1])
+                        b_d = torch.zeros_like(b_flipped)
+                        b_d[:, 1:] = b_flipped[:, :-1]
+                    else:
+                        b_d = boundaries
 
                     c_dl = s_l.c[d]
                     n_dl = s_l.n[d]
@@ -532,6 +597,7 @@ class sLSTM(nn.Module):
         return layer_output, ret_state
 
     def extra_repr(self) -> str:
+        """Returns extra representation string for module display."""
         return (
             f"input_size={self.input_size}, hidden_size={self.hidden_size}, "
             f"num_layers={self.num_layers}, num_heads={self.num_heads}, "
@@ -543,6 +609,7 @@ class sLSTM(nn.Module):
 
     @torch.no_grad()
     def clamp_forget_bias(self, max_val: float = _MAX_FORGET_BIAS) -> None:
+        """Clamps forget gate bias across all layers and directions."""
         HS = self.hidden_size
         for layer_idx in range(self.num_layers):
             for d in range(self.num_directions):

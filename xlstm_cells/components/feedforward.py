@@ -1,5 +1,7 @@
 # Copyright (c) NXAI GmbH and its affiliates 2024
 # Maximilian Beck
+"""Gated feedforward (GeGLU) module for sLSTM blocks."""
+
 import math
 import torch
 from torch import nn
@@ -9,7 +11,16 @@ from .init import small_init_init_, wang_init_
 
 
 class GatedFeedForward(nn.Module):
-    """Gated FeedForward (GeGLU) layer for post up-projection in sLSTM blocks."""
+    """Gated FeedForward (GeGLU) layer for post up-projection in sLSTM blocks.
+
+    Args:
+        d_model: Model hidden dimension.
+        proj_factor: Projection expansion factor. Default: 4.0 / 3.0.
+        act_fn: Activation function ("gelu", "silu", "swish", "relu"). Default: "gelu".
+        dropout: Dropout probability. Default: 0.0.
+        bias: Whether linear projections use bias. Default: False.
+        num_blocks: Number of stacked blocks in the model (for Wang init scaling). Default: 1.
+    """
 
     def __init__(
         self,
@@ -20,6 +31,7 @@ class GatedFeedForward(nn.Module):
         bias: bool = False,
         num_blocks: int = 1,
     ):
+        """Initializes GatedFeedForward layer."""
         super().__init__()
         self.d_model = d_model
         self.proj_up_dim = round(proj_factor * d_model)
@@ -32,7 +44,8 @@ class GatedFeedForward(nn.Module):
 
         self.reset_parameters()
 
-    def reset_parameters(self):
+    def reset_parameters(self) -> None:
+        """Initializes weights with small_init and wang_init schemes."""
         small_init_init_(self.proj_up.weight, dim=self.d_model)
         if self.proj_up.bias is not None:
             nn.init.zeros_(self.proj_up.bias)
@@ -41,6 +54,14 @@ class GatedFeedForward(nn.Module):
             nn.init.zeros_(self.proj_down.bias)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Applies gated feedforward transformation.
+
+        Args:
+            x: Input tensor of shape (B, T, d_model).
+
+        Returns:
+            Output tensor of shape (B, T, d_model).
+        """
         gate_raw, up = self.proj_up(x).split(self.proj_up_dim, dim=-1)
         if self.act_fn == "gelu":
             act = F.gelu(gate_raw)

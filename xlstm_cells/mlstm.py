@@ -74,6 +74,7 @@ class mLSTMState:
     @classmethod
     def init(cls, batch_size: int, num_heads: int, head_dim: int,
              device=None, dtype=None) -> "mLSTMState":
+        """Initializes zero state tensors for mLSTM."""
         H, Dh = num_heads, head_dim
         return cls(
             C=torch.zeros(batch_size, H, Dh, Dh, device=device, dtype=dtype),
@@ -82,14 +83,17 @@ class mLSTMState:
         )
 
     def detach(self) -> "mLSTMState":
+        """Detaches state tensors from the autograd graph."""
         return mLSTMState(self.C.detach(), self.n.detach(), self.m.detach())
 
     def to(self, *args, **kwargs) -> "mLSTMState":
+        """Moves state tensors to specified device or dtype."""
         return mLSTMState(self.C.to(*args, **kwargs),
                           self.n.to(*args, **kwargs),
                           self.m.to(*args, **kwargs))
 
     def clone(self) -> "mLSTMState":
+        """Returns a cloned copy of the state object."""
         return mLSTMState(self.C.clone(), self.n.clone(), self.m.clone())
 
     def __repr__(self) -> str:
@@ -211,15 +215,14 @@ def _mlstm_recurrent_scan_parallel(
         h = o * h
     outputs = h.reshape(B, T, hidden_size)
 
-    with torch.no_grad():
-        m_final = m_attn[..., -1]
-        f_decay_total = torch.exp(f_cum[..., -1] + m_init - m_final)
-        i_decay_total = torch.exp(d_raw[..., -1, :] - m_final[..., None])
-        v_weighted = torch.einsum("bht,bhtd->bhtd", i_decay_total, v_p)
-        C_final = (f_decay_total[..., None, None] * C_init +
-                   torch.einsum("bhtd,bhte->bhde", v_weighted, k_p))
-        n_final = (f_decay_total[..., None] * n_init +
-                   torch.einsum("bht,bhtd->bhd", i_decay_total, k_p))
+    m_final = m_attn[..., -1].detach()
+    f_decay_total = torch.exp(f_cum[..., -1] + m_init - m_final)
+    i_decay_total = torch.exp(d_raw[..., -1, :] - m_final[..., None])
+    v_weighted = torch.einsum("bht,bhtd->bhtd", i_decay_total, v_p)
+    C_final = (f_decay_total[..., None, None] * C_init +
+               torch.einsum("bhtd,bhte->bhde", v_weighted, k_p))
+    n_final = (f_decay_total[..., None] * n_init +
+               torch.einsum("bht,bhtd->bhd", i_decay_total, k_p))
 
     return outputs, C_final, n_final, m_final
 
@@ -271,10 +274,19 @@ def _mlstm_recurrent_scan_parallel_chunked(
 # ---------------------------------------------------------------------------
 
 class mLSTMCell(nn.Module):
-    """One time-step of mLSTM."""
+    """Single time-step Matrix LSTM (mLSTM) cell.
+
+    Args:
+        input_size: Input feature dimension.
+        hidden_size: Hidden feature dimension (must be divisible by num_heads).
+        num_heads: Number of matrix-memory heads. Default: 4.
+        bias: Whether projection layers include bias. Default: False.
+        eps: Denominator stabilizer epsilon. Default: 1e-3.
+    """
 
     def __init__(self, input_size: int, hidden_size: int, num_heads: int = 4,
                  bias: bool = False, eps: float = _EPS):
+        """Initializes single-step mLSTMCell."""
         super().__init__()
         assert hidden_size % num_heads == 0
         self.input_size = input_size
@@ -295,6 +307,7 @@ class mLSTMCell(nn.Module):
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
+        """Initializes projection and gate parameters."""
         small_init_init_(self.q_proj.weight, dim=self.input_size)
         small_init_init_(self.k_proj.weight, dim=self.input_size)
         small_init_init_(self.v_proj.weight, dim=self.input_size)
@@ -308,6 +321,7 @@ class mLSTMCell(nn.Module):
         nn.init.normal_(self.igate.bias, mean=0.0, std=0.1)
 
     def init_state(self, batch_size: int, device=None, dtype=None) -> mLSTMState:
+        """Initializes zero state for one step of mLSTM."""
         return mLSTMState.init(batch_size, self.num_heads, self.head_dim, device, dtype)
 
     def forward(
@@ -317,6 +331,17 @@ class mLSTMCell(nn.Module):
         v: Optional[torch.Tensor] = None,
         state: Optional[mLSTMState] = None,
     ) -> Tuple[torch.Tensor, mLSTMState]:
+        """Runs a single recurrent time-step of mLSTM.
+
+        Args:
+            x_or_q: Input token tensor (B, input_size) or precomputed q (B, hidden_size).
+            state_or_k: Previous mLSTMState, or precomputed k (B, hidden_size).
+            v: Optional precomputed v (B, hidden_size).
+            state: Previous mLSTMState when precomputed (q, k, v) are provided.
+
+        Returns:
+            Tuple of (output token tensor (B, hidden_size), new_state).
+        """
         if v is None and isinstance(state_or_k, mLSTMState):
             x_t = x_or_q
             st = state_or_k
@@ -360,6 +385,7 @@ class mLSTMCell(nn.Module):
 
     @torch.no_grad()
     def clamp_forget_bias(self, max_val: float = _MAX_FORGET_BIAS) -> None:
+        """Clamps forget gate bias to prevent numerical saturation."""
         if self.fgate.bias is not None:
             self.fgate.bias.data.clamp_(-max_val, max_val)
 
@@ -369,7 +395,28 @@ class mLSTMCell(nn.Module):
 # ---------------------------------------------------------------------------
 
 class mLSTM(nn.Module):
-    """Full-sequence mLSTM supporting Triton kernels and native chunked scans."""
+    """Multi-layer Matrix LSTM (mLSTM) sequence model.
+
+    Implements official xLSTM matrix memory recurrence with exponential gating,
+    supporting Triton kernel acceleration, native chunked parallel scans,
+    non-reentrant activation checkpointing, and packed document boundary resets.
+
+    Args:
+        input_size: Input feature dimension.
+        hidden_size: Hidden feature dimension (must be divisible by num_heads).
+        num_layers: Number of stacked mLSTM layers. Default: 1.
+        num_heads: Number of attention/recurrent heads per layer. Default: 4.
+        bias: Whether projection layers include bias. Default: False.
+        batch_first: If True, inputs/outputs have shape (B, T, D); otherwise (T, B, D). Default: True.
+        dropout: Dropout applied between stacked layers. Default: 0.0.
+        bidirectional: If True, processes sequence in both forward and backward directions. Default: False.
+        pack_state: If True, returns states as a tuple across layers. Default: True.
+        use_checkpoint: Whether to use gradient activation checkpointing. Default: False.
+        use_triton_kernels: Whether to use Triton kernels from mlstm_kernels if available. Default: True.
+        chunkwise_kernel: Name of Triton chunkwise kernel ("limit_chunk" or "xl_chunk"). Default: "xl_chunk".
+        chunk_size: Chunk size for chunked parallel scan. Default: 128.
+        eps: Denominator stabilizer epsilon. Default: 1e-3.
+    """
 
     def __init__(
         self,
@@ -388,6 +435,7 @@ class mLSTM(nn.Module):
         chunk_size: int = _MLSTM_CHUNK_SIZE,
         eps: Optional[float] = None,
     ):
+        """Initializes multi-layer mLSTM sequence model."""
         super().__init__()
         assert hidden_size % num_heads == 0
         if chunkwise_kernel not in _TRITON_CHUNKWISE_KERNELS:
@@ -442,11 +490,12 @@ class mLSTM(nn.Module):
         if self._use_triton_kernels:
             self._init_triton_backend()
 
-    def flatten_parameters(self):
+    def flatten_parameters(self) -> None:
         """No-op for nn.LSTM compatibility."""
         pass
 
-    def _init_triton_backend(self):
+    def _init_triton_backend(self) -> None:
+        """Initializes Triton backend configuration."""
         config = mLSTMBackendConfig(
             chunkwise_kernel=_TRITON_CHUNKWISE_KERNELS[self._chunkwise_kernel],
             sequence_kernel="native_sequence__triton",
@@ -458,7 +507,8 @@ class mLSTM(nn.Module):
         )
         self._mlstm_backend = mLSTMBackend(config=config)
 
-    def reset_parameters(self):
+    def reset_parameters(self) -> None:
+        """Initializes layer parameters."""
         for layer_idx in range(self.num_layers):
             for d in range(self.num_directions):
                 in_sz = self.input_size if layer_idx == 0 else self.hidden_size * self.num_directions
@@ -481,6 +531,7 @@ class mLSTM(nn.Module):
                 nn.init.normal_(ig.bias, mean=0.0, std=0.1)
 
     def init_state(self, batch_size: int, device=None, dtype=None) -> Union[mLSTMState, Tuple[mLSTMState, ...]]:
+        """Initializes zero state structures for all layers."""
         states = []
         for layer_idx in range(self.num_layers):
             Hh = self.num_heads[layer_idx]
@@ -618,6 +669,16 @@ class mLSTM(nn.Module):
         state=None,
         boundaries: Optional[torch.Tensor] = None,
     ):
+        """Forward pass through the multi-layer mLSTM model.
+
+        Args:
+            input: Input tensor of shape (B, T, D) if batch_first else (T, B, D).
+            state: Optional previous state (mLSTMState or tuple of states per layer).
+            boundaries: Optional boolean mask of shape (B, T) indicating document start boundaries.
+
+        Returns:
+            Tuple of (output tensor, final state).
+        """
         if not self.batch_first:
             input = input.transpose(0, 1)
 
@@ -675,7 +736,12 @@ class mLSTM(nn.Module):
                 dir_outputs: List[torch.Tensor] = []
                 for d in range(self.num_directions):
                     l_in = torch.flip(layer_input, [1]) if d == 1 else layer_input
-                    b_d = torch.flip(boundaries, [1]) if (d == 1 and boundaries is not None) else boundaries
+                    if d == 1 and boundaries is not None:
+                        b_flipped = torch.flip(boundaries, [1])
+                        b_d = torch.zeros_like(b_flipped)
+                        b_d[:, 1:] = b_flipped[:, :-1]
+                    else:
+                        b_d = boundaries
                     C_dl = s_l.C[d]
                     n_dl = s_l.n[d]
                     m_dl = s_l.m[d]
@@ -716,6 +782,7 @@ class mLSTM(nn.Module):
         return layer_output, ret_state
 
     def extra_repr(self) -> str:
+        """Returns extra representation string for module display."""
         return (
             f"input_size={self.input_size}, hidden_size={self.hidden_size}, "
             f"num_layers={self.num_layers}, num_heads={self.num_heads}, "
@@ -728,6 +795,7 @@ class mLSTM(nn.Module):
 
     @torch.no_grad()
     def clamp_forget_bias(self, max_val: float = _MAX_FORGET_BIAS) -> None:
+        """Clamps forget gate bias across all layers and directions."""
         for layer_idx in range(self.num_layers):
             for d in range(self.num_directions):
                 fg = getattr(self, f"fgate_{d}_{layer_idx}")
