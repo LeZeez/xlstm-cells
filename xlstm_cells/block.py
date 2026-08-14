@@ -28,14 +28,12 @@ def _group_norm_bhwc(
     x: torch.Tensor, num_groups: int, weight: torch.Tensor,
     bias: torch.Tensor, eps: float = _GN_EPS,
 ) -> torch.Tensor:
-    """GroupNorm working directly on (B, T, C) layout -- no transposes.
+    """Per-token head-wise normalization working directly on (B, T, C) layout -- no transposes.
 
-    Equivalent to ``nn.GroupNorm(groups, C)`` applied to (B, C, T) but
-    operates via reshape so that the tensor stays contiguous.  This eliminates
-    two ``aten::copy_`` calls per block per forward pass.
-
-    Normalisation is computed over (T, D) for each (B, G) where
-    D = C // G, matching the standard GroupNorm semantics.
+    Computes LayerNorm per head (MultiHeadLayerNorm) over the channel
+    dimension D = C // num_groups for each token (b, t) independently,
+    matching the official xLSTM paper semantics and preventing cross-time
+    gradient coupling.
     """
     B, T, C = x.shape
     G = num_groups
@@ -43,8 +41,8 @@ def _group_norm_bhwc(
 
     y = x.reshape(B, T, G, D)
 
-    mean = y.mean(dim=(1, 3), keepdim=True)
-    var = y.var(dim=(1, 3), keepdim=True, unbiased=False)
+    mean = y.mean(dim=-1, keepdim=True)
+    var = y.var(dim=-1, keepdim=True, unbiased=False)
     y = (y - mean) / torch.sqrt(var + eps)
 
     y = y.reshape(B, T, C)
