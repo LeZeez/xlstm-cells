@@ -47,17 +47,17 @@ class LayerNorm(nn.Module):
         else:
             return self.weight
 
-    def forward(self, input: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Applies layer normalization over the last dimension.
 
         Args:
-            input: Input tensor of shape (*, ndim).
+            x: Input tensor of shape (*, ndim).
 
         Returns:
             Normalized tensor of same shape as input.
         """
         return F.layer_norm(
-            input, normalized_shape=(self.ndim,), weight=self.weight_proxy, bias=self.bias, eps=self.eps
+            x, normalized_shape=(self.ndim,), weight=self.weight_proxy, bias=self.bias, eps=self.eps
         )
 
     def reset_parameters(self) -> None:
@@ -79,19 +79,19 @@ class MultiHeadLayerNorm(LayerNorm):
     Supports both 4D (B, NH, S, DH) and 3D (B, S, C) layouts.
     """
 
-    def forward(self, input: torch.Tensor, num_heads: Optional[int] = None) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, num_heads: Optional[int] = None) -> torch.Tensor:
         """Applies multi-head layer normalization per token across head channels.
 
         Args:
-            input: Input tensor of shape (B, NH, S, DH) or (B, S, C).
+            x: Input tensor of shape (B, NH, S, DH) or (B, S, C).
             num_heads: Number of attention/recurrent heads (required for 3D inputs).
 
         Returns:
             Normalized tensor matching the input shape.
         """
-        if input.dim() == 4:
-            B, NH, S, DH = input.shape
-            gn_in_1 = input.transpose(1, 2)  # (B, S, NH, DH)
+        if x.dim() == 4:
+            B, NH, S, DH = x.shape
+            gn_in_1 = x.transpose(1, 2)  # (B, S, NH, DH)
             gn_in_2 = gn_in_1.reshape(B * S, NH * DH)  # (B * S, NH * DH)
             out = F.group_norm(
                 gn_in_2,
@@ -102,10 +102,10 @@ class MultiHeadLayerNorm(LayerNorm):
             )
             # (B * S, NH * DH) -> (B, S, NH, DH) -> (B, NH, S, DH)
             return out.view(B, S, NH, DH).transpose(1, 2)
-        elif input.dim() == 3:
-            B, S, C = input.shape
+        elif x.dim() == 3:
+            B, S, C = x.shape
             assert num_heads is not None, "num_heads must be provided for 3D input (B, S, C)"
-            gn_in = input.reshape(B * S, C)
+            gn_in = x.reshape(B * S, C)
             out = F.group_norm(
                 gn_in,
                 num_groups=num_heads,
@@ -115,4 +115,4 @@ class MultiHeadLayerNorm(LayerNorm):
             )
             return out.view(B, S, C)
         else:
-            raise ValueError(f"MultiHeadLayerNorm expects 3D or 4D input, got {input.dim()}D")
+            raise ValueError(f"MultiHeadLayerNorm expects 3D or 4D input, got {x.dim()}D")
