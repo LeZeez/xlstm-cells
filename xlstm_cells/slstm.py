@@ -91,8 +91,35 @@ class sLSTMState:
 
 
 # ---------------------------------------------------------------------------
-# Fused sequential scan (Vanilla Backend)
+# Fused sequential scan (Vanilla Backend & CUDA Autograd)
 # ---------------------------------------------------------------------------
+
+class _sLSTMCudaFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, slstm_func, training, x_cuda, s0_cuda, R_cuda, b_cuda):
+        states, cache_g_r, cache_g_i = slstm_func.forward(
+            training, x_cuda.contiguous(), s0_cuda.contiguous(),
+            R_cuda.contiguous(), b_cuda.contiguous()
+        )
+        ctx.save_for_backward(R_cuda, b_cuda, states, cache_g_r, cache_g_i)
+        ctx.slstm_func = slstm_func
+        ctx.training = training
+        return states
+
+    @staticmethod
+    def backward(ctx, grad_states):
+        if not ctx.training:
+            raise RuntimeError("sLSTM CUDA backward only supported when training=True")
+        R_cuda, b_cuda, states, cache_g_r, cache_g_i = ctx.saved_tensors
+        R_t = R_cuda.permute(0, 2, 1).contiguous()
+        grads = ctx.slstm_func.backward(
+            R_t, b_cuda.contiguous(), states.contiguous(),
+            cache_g_r.contiguous(), cache_g_i.contiguous(),
+            grad_states.contiguous()
+        )
+        dx, ds0, dR, db = grads
+        return None, None, dx, ds0, dR, db
+
 
 def _slstm_scan_sequential(
     all_in: torch.Tensor,
@@ -466,6 +493,81 @@ class sLSTM(nn.Module):
 
         return torch.cat(outputs, dim=1), c, n, m, h
 
+    def _run_layer_cuda(
+        self,
+        x: torch.Tensor,
+        d: int,
+        layer_idx: int,
+        c: torch.Tensor,
+        n: torch.Tensor,
+        m: torch.Tensor,
+        h: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Runs sLSTM layer recurrence using the official CUDA backend."""
+        B, T, _ = x.shape
+        Hh = self.num_heads[layer_idx]
+        Dh = self.hidden_size // Hh
+        HS = self.hidden_size
+
+        w_all = getattr(self, f"W_all_{d}_{layer_idx}")
+        r_fused = getattr(self, f"R_fused_{d}_{layer_idx}")
+
+        all_wx = w_all(x)
+        z_wx, i_wx, f_wx, o_wx = all_wx.chunk(4, dim=-1)
+        z_head = z_wx.view(B, T, Hh, Dh)
+        i_head = i_wx.view(B, T, Hh, Dh)
+        f_head = f_wx.view(B, T, Hh, Dh)
+        o_head = o_wx.view(B, T, Hh, Dh)
+
+        all_in_cuda = torch.cat([i_head, f_head, z_head, o_head], dim=-1)
+        x_cuda = all_in_cuda.view(B, T, Hh, 4, Dh).permute(1, 0, 2, 3, 4).reshape(T, B, 4 * HS).contiguous()
+
+        Rz, Ri, Rf, Ro = r_fused.chunk(4, dim=-1)
+        R_cuda = torch.cat([Ri, Rf, Rz, Ro], dim=-1).contiguous()
+
+        b_cuda = torch.zeros(4 * HS, device=x.device, dtype=x.dtype)
+        s0_cuda = torch.stack([
+            h.reshape(B, HS),
+            c.reshape(B, HS),
+            n.reshape(B, HS),
+            m.reshape(B, HS)
+        ], dim=0).contiguous()
+
+        slstm_func = self._cuda_kernel.sLSTMFunc(self.training, B, HS, Hh)
+        states_cuda = _sLSTMCudaFunction.apply(slstm_func, self.training, x_cuda, s0_cuda, R_cuda, b_cuda)
+
+        out_TBH = states_cuda[0, 1:]
+        out = out_TBH.transpose(0, 1)
+
+        h_out = states_cuda[0, -1].view(B, Hh, Dh)
+        c_out = states_cuda[1, -1].view(B, Hh, Dh)
+        n_out = states_cuda[2, -1].view(B, Hh, Dh)
+        m_out = states_cuda[3, -1].view(B, Hh, Dh)
+
+        return out, c_out, n_out, m_out, h_out
+
+    def _run_layer(
+        self,
+        x: torch.Tensor,
+        d: int,
+        layer_idx: int,
+        c: torch.Tensor,
+        n: torch.Tensor,
+        m: torch.Tensor,
+        h: torch.Tensor,
+        boundaries: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Runs sLSTM layer recurrence routing to CUDA or Vanilla scan."""
+        if (
+            self.backend == "cuda"
+            and self._cuda_kernel is not None
+            and x.is_cuda
+            and boundaries is None
+            and not torch._dynamo.is_compiling()
+        ):
+            return self._run_layer_cuda(x, d, layer_idx, c, n, m, h)
+        return self._run_layer_vanilla(x, d, layer_idx, c, n, m, h, boundaries=boundaries)
+
     def forward(
         self,
         input: torch.Tensor,
@@ -504,18 +606,7 @@ class sLSTM(nn.Module):
         if packed and bounds_mode == PackedBoundariesMode.DISABLE_CKPT_IN_PACKED:
             ckpt_active = False
 
-        out_states: List[sLSTMState] = []
-        for layer_idx in range(self.num_layers):
-            Hh = self.num_heads[layer_idx]
-            Dh = self.hidden_size // Hh
-            D = self.num_directions
-            out_states.append(sLSTMState(
-                c=torch.empty(D, B, Hh, Dh, device=input.device, dtype=input.dtype),
-                n=torch.empty(D, B, Hh, Dh, device=input.device, dtype=input.dtype),
-                m=torch.empty(D, B, Hh, Dh, device=input.device, dtype=input.dtype),
-                h=torch.empty(D, B, Hh, Dh, device=input.device, dtype=input.dtype),
-            ))
-
+        final_states: List[sLSTMState] = []
         layer_input = input
 
         for layer_idx in range(self.num_layers):
@@ -529,23 +620,30 @@ class sLSTM(nn.Module):
 
                 if ckpt_active:
                     out, c_out, n_out, m_out, h_out = _torch_checkpoint(
-                        self._run_layer_vanilla, layer_input, 0, layer_idx,
+                        self._run_layer, layer_input, 0, layer_idx,
                         c_dl, n_dl, m_dl, h_dl, boundaries,
                         use_reentrant=False,
                     )
                 else:
-                    out, c_out, n_out, m_out, h_out = self._run_layer_vanilla(
+                    out, c_out, n_out, m_out, h_out = self._run_layer(
                         layer_input, 0, layer_idx, c_dl, n_dl, m_dl, h_dl,
                         boundaries=boundaries,
                     )
 
                 layer_output = out
-                out_states[layer_idx].c[0].copy_(c_out)
-                out_states[layer_idx].n[0].copy_(n_out)
-                out_states[layer_idx].m[0].copy_(m_out)
-                out_states[layer_idx].h[0].copy_(h_out)
+                final_states.append(sLSTMState(
+                    c=c_out.unsqueeze(0),
+                    n=n_out.unsqueeze(0),
+                    m=m_out.unsqueeze(0),
+                    h=h_out.unsqueeze(0),
+                ))
             else:
                 dir_outputs: List[torch.Tensor] = []
+                c_dirs: List[torch.Tensor] = []
+                n_dirs: List[torch.Tensor] = []
+                m_dirs: List[torch.Tensor] = []
+                h_dirs: List[torch.Tensor] = []
+
                 for d in range(self.num_directions):
                     l_in = torch.flip(layer_input, [1]) if d == 1 else layer_input
                     if d == 1 and boundaries is not None:
@@ -562,12 +660,12 @@ class sLSTM(nn.Module):
 
                     if ckpt_active:
                         out, c_out, n_out, m_out, h_out = _torch_checkpoint(
-                            self._run_layer_vanilla, l_in, d, layer_idx,
+                            self._run_layer, l_in, d, layer_idx,
                             c_dl, n_dl, m_dl, h_dl, b_d,
                             use_reentrant=False,
                         )
                     else:
-                        out, c_out, n_out, m_out, h_out = self._run_layer_vanilla(
+                        out, c_out, n_out, m_out, h_out = self._run_layer(
                             l_in, d, layer_idx, c_dl, n_dl, m_dl, h_dl,
                             boundaries=b_d,
                         )
@@ -575,12 +673,18 @@ class sLSTM(nn.Module):
                     if d == 1:
                         out = torch.flip(out, [1])
                     dir_outputs.append(out)
-                    out_states[layer_idx].c[d].copy_(c_out)
-                    out_states[layer_idx].n[d].copy_(n_out)
-                    out_states[layer_idx].m[d].copy_(m_out)
-                    out_states[layer_idx].h[d].copy_(h_out)
+                    c_dirs.append(c_out)
+                    n_dirs.append(n_out)
+                    m_dirs.append(m_out)
+                    h_dirs.append(h_out)
 
                 layer_output = torch.cat(dir_outputs, dim=-1)
+                final_states.append(sLSTMState(
+                    c=torch.stack(c_dirs, dim=0),
+                    n=torch.stack(n_dirs, dim=0),
+                    m=torch.stack(m_dirs, dim=0),
+                    h=torch.stack(h_dirs, dim=0),
+                ))
 
             if self.drop is not None and layer_idx < self.num_layers - 1:
                 layer_output = self.drop(layer_output)
@@ -590,9 +694,9 @@ class sLSTM(nn.Module):
             layer_output = layer_output.transpose(0, 1)
 
         if self.pack_state:
-            ret_state = tuple(out_states)
+            ret_state = tuple(final_states)
         else:
-            ret_state = out_states[0] if self.num_layers == 1 else tuple(out_states)
+            ret_state = final_states[0] if self.num_layers == 1 else tuple(final_states)
 
         return layer_output, ret_state
 

@@ -172,7 +172,7 @@ public:
     const auto options = recurrent_kernel_t.options();
     const at::cuda::CUDAGuard guard(options.device_index());
 
-    Tensor dR = torch::zeros({SLSTM_NUM_HEADS, hidden_size / num_heads,
+    Tensor dR = torch::zeros({num_heads, hidden_size / num_heads,
                               (hidden_size * SLSTM_NUM_GATES) / num_heads},
                              options);
     Tensor db = torch::zeros_like(bias);

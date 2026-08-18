@@ -25,18 +25,25 @@ Architectures:
 from __future__ import annotations
 
 import math
+import os
+import warnings
 from typing import Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint as _torch_checkpoint
 
+from ._utils import (
+    PackedBoundariesMode,
+    get_packed_boundaries_override_mode,
+)
 from .components.conv import CausalConv1d
 from .components.feedforward import GatedFeedForward
 from .components.init import bias_linspace_init_, small_init_init_, wang_init_
 from .components.ln import LayerNorm, MultiHeadLayerNorm
 from .mlstm import _MAX_FORGET_BIAS, _MLSTM_CHUNK_SIZE, _BOUNDARY_RESET_LOGF, _EPS, mLSTMState
-from .slstm import sLSTM, sLSTMState
+from .slstm import sLSTM, sLSTMState, _slstm_scan_sequential, _sLSTMCudaFunction
 
 try:
     from mlstm_kernels.torch.backend_module import (
@@ -367,9 +374,18 @@ class sLSTMBlock(nn.Module):
         """Initializes paper-compliant sLSTMBlock."""
         super().__init__()
         assert d_model % num_heads == 0, f"d_model ({d_model}) must be divisible by num_heads ({num_heads})"
+        if backend == "cuda" and fast_mode:
+            raise ValueError("sLSTMBlock: backend='cuda' cannot be combined with fast_mode=True.")
+        if backend not in ("vanilla", "cuda"):
+            raise ValueError(f"sLSTMBlock: unknown backend '{backend}'. Must be 'vanilla' or 'cuda'.")
+
         self.d_model = d_model
         self.num_heads = num_heads
         self.head_dim = d_model // num_heads
+        self.backend = backend
+        self.use_checkpoint = use_checkpoint
+        self.fast_mode = fast_mode
+        self.fast_chunk_size = fast_chunk_size
 
         self.ln = LayerNorm(d_model, bias=False)
 
@@ -378,18 +394,10 @@ class sLSTMBlock(nn.Module):
         else:
             self.conv = None
 
-        self.lstm = sLSTM(
-            input_size=d_model,
-            hidden_size=d_model,
-            num_layers=1,
-            num_heads=num_heads,
-            bias=bias,
-            batch_first=True,
-            backend=backend,
-            use_checkpoint=use_checkpoint,
-            fast_mode=fast_mode,
-            fast_chunk_size=fast_chunk_size,
-        )
+        # Decoupled Figure 10 projections: (i, f) from conv; (z, o) from unconvolved
+        self.W_if = nn.Linear(d_model, 2 * d_model, bias=bias)
+        self.W_zo = nn.Linear(d_model, 2 * d_model, bias=bias)
+        self.R_fused = nn.Parameter(torch.empty(num_heads, self.head_dim, 4 * self.head_dim))
 
         self.gn = MultiHeadLayerNorm(ndim=d_model, weight=True, bias=False, eps=1e-5)
 
@@ -405,21 +413,158 @@ class sLSTMBlock(nn.Module):
         )
         self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
 
-        self.reset_parameters()
+        self._compiled_scans = {}
+        self._cuda_kernel = None
+        if backend == "cuda":
+            self._init_cuda_backend()
 
-    def reset_parameters(self) -> None:
+        self.reset_parameters(num_blocks=num_blocks)
+
+    def _init_cuda_backend(self) -> None:
+        """Compiles and loads the official sLSTM CUDA C++ extension."""
+        try:
+            from .cuda.cuda_init import load
+            curdir = os.path.dirname(__file__)
+            src_dir = os.path.join(curdir, "cuda")
+            sources = [
+                os.path.join(src_dir, "cuda", "slstm.cc"),
+                os.path.join(src_dir, "cuda", "slstm_forward.cu"),
+                os.path.join(src_dir, "cuda", "slstm_backward.cu"),
+                os.path.join(src_dir, "cuda", "slstm_backward_cut.cu"),
+                os.path.join(src_dir, "cuda", "slstm_pointwise.cu"),
+                os.path.join(src_dir, "util", "blas.cu"),
+                os.path.join(src_dir, "util", "cuda_error.cu"),
+            ]
+            self._cuda_kernel = load(name="slstm_cuda", sources=sources)
+        except Exception as e:
+            warnings.warn(f"sLSTMBlock: failed to compile CUDA kernel ({e}). Falling back to backend='vanilla'.")
+            self.backend = "vanilla"
+
+    def reset_parameters(self, num_blocks: int = 1) -> None:
         """Resets all block layer parameters."""
+        Dh = self.head_dim
+        HS = self.d_model
+        NH = self.num_heads
+
         self.ln.reset_parameters()
         if self.conv is not None:
             self.conv.reset_parameters()
-        self.lstm.reset_parameters()
+
+        w_if = self.W_if.weight.data
+        small_init_init_(w_if[:HS], dim=HS)
+        small_init_init_(w_if[HS:2*HS], dim=HS)
+        if self.W_if.bias is not None:
+            nn.init.zeros_(self.W_if.bias)
+            nn.init.normal_(self.W_if.bias.data[:HS], mean=0.0, std=0.1)
+            f_biases = torch.linspace(3.4, 6.0, NH).unsqueeze(-1).expand(NH, Dh).reshape(-1)
+            self.W_if.bias.data[HS:2*HS].copy_(f_biases)
+
+        w_zo = self.W_zo.weight.data
+        small_init_init_(w_zo[:HS], dim=HS)
+        small_init_init_(w_zo[HS:2*HS], dim=HS)
+        if self.W_zo.bias is not None:
+            nn.init.zeros_(self.W_zo.bias)
+
+        R = self.R_fused.data
+        for h in range(NH):
+            for g in range(4):
+                tmp = torch.empty_like(R[h, :, g*Dh:(g+1)*Dh])
+                nn.init.orthogonal_(tmp)
+                R[h, :, g*Dh:(g+1)*Dh] = tmp
+
         self.gn.reset_parameters()
         self.ffn_norm.reset_parameters()
         self.ffn.reset_parameters()
 
     def init_state(self, batch_size: int, device=None, dtype=None) -> sLSTMState:
         """Initializes zero state object for sLSTM recurrence."""
-        return self.lstm.init_state(batch_size, device, dtype)
+        return sLSTMState.init(batch_size, self.num_heads, self.head_dim, device, dtype)
+
+    def _get_compiled_scan(self, chunk_size: int):
+        """Returns or compiles torch.compile scan kernel for the specified chunk size."""
+        if chunk_size not in self._compiled_scans:
+            def scan_chunk(all_in, R, c, n, m, h, b=None):
+                return _slstm_scan_sequential(all_in, R, c, n, m, h, b)
+            self._compiled_scans[chunk_size] = torch.compile(scan_chunk, dynamic=False)
+        return self._compiled_scans[chunk_size]
+
+    def _run_core_vanilla(
+        self,
+        all_in: torch.Tensor,
+        c: torch.Tensor,
+        n: torch.Tensor,
+        m: torch.Tensor,
+        h: torch.Tensor,
+        boundaries: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Runs sLSTM recurrence using the vanilla PyTorch scan backend."""
+        B, T, _, _ = all_in.shape
+        if not self.fast_mode or T <= self.fast_chunk_size:
+            return _slstm_scan_sequential(all_in, self.R_fused, c, n, m, h, boundaries)
+
+        C = self.fast_chunk_size
+        fn_c = self._get_compiled_scan(C)
+        b_chunks = []
+        if boundaries is not None:
+            for i in range(0, T, C):
+                b_chunks.append(boundaries[:, i:min(i+C, T)])
+
+        outputs = []
+        n_chunks = math.ceil(T / C)
+        for idx in range(n_chunks):
+            start = idx * C
+            end = min(start + C, T)
+            chunk_in = all_in[:, start:end]
+            b_chunk = b_chunks[idx] if boundaries is not None else None
+
+            if (end - start) == C:
+                out_chunk, c, n, m, h = fn_c(chunk_in, self.R_fused, c, n, m, h, b_chunk)
+            else:
+                out_chunk, c, n, m, h = _slstm_scan_sequential(chunk_in, self.R_fused, c, n, m, h, b_chunk)
+            outputs.append(out_chunk)
+
+        return torch.cat(outputs, dim=1), c, n, m, h
+
+    def _run_core_cuda(
+        self,
+        all_in: torch.Tensor,
+        c: torch.Tensor,
+        n: torch.Tensor,
+        m: torch.Tensor,
+        h: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Runs sLSTM recurrence using official CUDA backend."""
+        B, T, Hh, _ = all_in.shape
+        Dh = self.head_dim
+        HS = self.d_model
+
+        z_in, i_in, f_in, o_in = all_in.chunk(4, dim=-1)
+        all_in_cuda = torch.cat([i_in, f_in, z_in, o_in], dim=-1)
+        x_cuda = all_in_cuda.view(B, T, Hh, 4, Dh).permute(1, 0, 2, 3, 4).reshape(T, B, 4 * HS).contiguous()
+
+        Rz, Ri, Rf, Ro = self.R_fused.chunk(4, dim=-1)
+        R_cuda = torch.cat([Ri, Rf, Rz, Ro], dim=-1).contiguous()
+
+        b_cuda = torch.zeros(4 * HS, device=all_in.device, dtype=all_in.dtype)
+        s0_cuda = torch.stack([
+            h.reshape(B, HS),
+            c.reshape(B, HS),
+            n.reshape(B, HS),
+            m.reshape(B, HS)
+        ], dim=0).contiguous()
+
+        slstm_func = self._cuda_kernel.sLSTMFunc(self.training, B, HS, Hh)
+        states_cuda = _sLSTMCudaFunction.apply(slstm_func, self.training, x_cuda, s0_cuda, R_cuda, b_cuda)
+
+        out_TBH = states_cuda[0, 1:]
+        out = out_TBH.transpose(0, 1)
+
+        h_out = states_cuda[0, -1].view(B, Hh, Dh)
+        c_out = states_cuda[1, -1].view(B, Hh, Dh)
+        n_out = states_cuda[2, -1].view(B, Hh, Dh)
+        m_out = states_cuda[3, -1].view(B, Hh, Dh)
+
+        return out, c_out, n_out, m_out, h_out
 
     def forward(
         self,
@@ -437,27 +582,75 @@ class sLSTMBlock(nn.Module):
         Returns:
             Tuple of (output_tensor, new_state).
         """
+        B, T, _ = x.shape
         residual = x
         x_norm = self.ln(x)
 
         if self.conv is not None:
-            c = F.silu(self.conv(x_norm))
-            x_in = x_norm + c
+            x_conv = F.silu(self.conv(x_norm))
         else:
-            x_in = x_norm
+            x_conv = x_norm
 
-        h, state = self.lstm(x_in, state, boundaries=boundaries)
-        if isinstance(state, tuple) and len(state) == 1:
-            state = state[0]
-        h_norm = self.gn(h, num_heads=self.num_heads)
+        if state is None:
+            state = self.init_state(B, device=x.device, dtype=x.dtype)
+
+        # Decoupled Figure 10 projections
+        i_raw, f_raw = self.W_if(x_conv).split(self.d_model, dim=-1)
+        z_raw, o_raw = self.W_zo(x_norm).split(self.d_model, dim=-1)
+
+        H, Dh = self.num_heads, self.head_dim
+        z_in = z_raw.view(B, T, H, Dh)
+        i_in = i_raw.view(B, T, H, Dh)
+        f_in = f_raw.view(B, T, H, Dh)
+        o_in = o_raw.view(B, T, H, Dh)
+
+        all_in = torch.cat([z_in, i_in, f_in, o_in], dim=-1)
+
+        c_in = state.c.squeeze(0) if state.c.dim() == 4 else state.c
+        n_in = state.n.squeeze(0) if state.n.dim() == 4 else state.n
+        m_in = state.m.squeeze(0) if state.m.dim() == 4 else state.m
+        h_in = state.h.squeeze(0) if state.h.dim() == 4 else state.h
+
+        use_cuda = (
+            self.backend == "cuda"
+            and self._cuda_kernel is not None
+            and x.is_cuda
+            and boundaries is None
+            and not torch._dynamo.is_compiling()
+        )
+
+        packed = boundaries is not None
+        bounds_mode = get_packed_boundaries_override_mode()
+        ckpt_active = bool(self.use_checkpoint and self.training)
+        if packed and bounds_mode == PackedBoundariesMode.DISABLE_CKPT_IN_PACKED:
+            ckpt_active = False
+
+        if use_cuda:
+            h_lstm, c_out, n_out, m_out, h_out = self._run_core_cuda(
+                all_in, c_in, n_in, m_in, h_in
+            )
+        elif ckpt_active:
+            h_lstm, c_out, n_out, m_out, h_out = _torch_checkpoint(
+                self._run_core_vanilla, all_in, c_in, n_in, m_in, h_in, boundaries,
+                use_reentrant=False,
+            )
+        else:
+            h_lstm, c_out, n_out, m_out, h_out = self._run_core_vanilla(
+                all_in, c_in, n_in, m_in, h_in, boundaries=boundaries
+            )
+
+        h_norm = self.gn(h_lstm, num_heads=self.num_heads)
         x_mid = residual + self.dropout(h_norm)
 
         # Post-sLSTM GeGLU MLP
         x_mlp = self.ffn(self.ffn_norm(x_mid))
         out = x_mid + x_mlp
-        return out, state
+        new_state = sLSTMState(c_out, n_out, m_out, h_out)
+        return out, new_state
 
     @torch.no_grad()
     def clamp_forget_bias(self, max_val: float = _MAX_FORGET_BIAS) -> None:
         """Clamps forget gate bias to prevent numerical saturation."""
-        self.lstm.clamp_forget_bias(max_val)
+        HS = self.d_model
+        if self.W_if.bias is not None:
+            self.W_if.bias.data[HS:2*HS].clamp_(-max_val, max_val)

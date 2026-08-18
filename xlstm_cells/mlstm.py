@@ -695,17 +695,7 @@ class mLSTM(nn.Module):
         if packed and bounds_mode == PackedBoundariesMode.DISABLE_CKPT_IN_PACKED:
             ckpt_active = False
 
-        out_states: List[mLSTMState] = []
-        for layer_idx in range(self.num_layers):
-            Hh = self.num_heads[layer_idx]
-            Dh = self.hidden_size // Hh
-            D = self.num_directions
-            out_states.append(mLSTMState(
-                C=torch.empty(D, B, Hh, Dh, Dh, device=input.device, dtype=input.dtype),
-                n=torch.empty(D, B, Hh, Dh, device=input.device, dtype=input.dtype),
-                m=torch.empty(D, B, Hh, device=input.device, dtype=input.dtype),
-            ))
-
+        final_states: List[mLSTMState] = []
         layer_input = input
 
         for layer_idx in range(self.num_layers):
@@ -729,11 +719,17 @@ class mLSTM(nn.Module):
                     )
 
                 layer_output = out
-                out_states[layer_idx].C[0].copy_(C_out)
-                out_states[layer_idx].n[0].copy_(n_out)
-                out_states[layer_idx].m[0].copy_(m_out)
+                final_states.append(mLSTMState(
+                    C=C_out.unsqueeze(0),
+                    n=n_out.unsqueeze(0),
+                    m=m_out.unsqueeze(0),
+                ))
             else:
                 dir_outputs: List[torch.Tensor] = []
+                C_dirs: List[torch.Tensor] = []
+                n_dirs: List[torch.Tensor] = []
+                m_dirs: List[torch.Tensor] = []
+
                 for d in range(self.num_directions):
                     l_in = torch.flip(layer_input, [1]) if d == 1 else layer_input
                     if d == 1 and boundaries is not None:
@@ -761,11 +757,16 @@ class mLSTM(nn.Module):
                     if d == 1:
                         out = torch.flip(out, [1])
                     dir_outputs.append(out)
-                    out_states[layer_idx].C[d].copy_(C_out)
-                    out_states[layer_idx].n[d].copy_(n_out)
-                    out_states[layer_idx].m[d].copy_(m_out)
+                    C_dirs.append(C_out)
+                    n_dirs.append(n_out)
+                    m_dirs.append(m_out)
 
                 layer_output = torch.cat(dir_outputs, dim=-1)
+                final_states.append(mLSTMState(
+                    C=torch.stack(C_dirs, dim=0),
+                    n=torch.stack(n_dirs, dim=0),
+                    m=torch.stack(m_dirs, dim=0),
+                ))
 
             if self.drop is not None and layer_idx < self.num_layers - 1:
                 layer_output = self.drop(layer_output)
@@ -775,9 +776,9 @@ class mLSTM(nn.Module):
             layer_output = layer_output.transpose(0, 1)
 
         if self.pack_state:
-            ret_state = tuple(out_states)
+            ret_state = tuple(final_states)
         else:
-            ret_state = out_states[0] if self.num_layers == 1 else tuple(out_states)
+            ret_state = final_states[0] if self.num_layers == 1 else tuple(final_states)
 
         return layer_output, ret_state
 
