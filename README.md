@@ -118,8 +118,8 @@ pip install mlstm_kernels
 ```
 
 ```python
-mLSTM(128, 256, use_triton_kernels=True, chunkwise_kernel="xl_chunk", chunk_size=128, eps=1e-3)
-mLSTMBlock(512, use_triton_kernels=True, chunkwise_kernel="xl_chunk", chunk_size=128, eps=1e-3)
+mLSTM(128, 256, use_triton_kernels=True, chunkwise_kernel="xl_chunk", chunk_size=128, eps=1e-6)
+mLSTMBlock(512, use_triton_kernels=True, chunkwise_kernel="xl_chunk", chunk_size=128, eps=1e-6)
 ```
 
 If Triton is unavailable (CPU input, sequence length non-divisible by chunk size, or under `torch.compile`), it falls back automatically to the native chunked-parallel scan.

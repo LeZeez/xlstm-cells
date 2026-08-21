@@ -104,10 +104,17 @@ class CausalConv1d(nn.Module):
         if conv_state is not None:
             y = y[:, :, conv_state.shape[1] :]
 
-        if return_last_state:
-            return y[:, :, : -self.pad].transpose(2, 1), x[:, -self.pad :]
+        if self.pad > 0:
+            out = y[:, :, : -self.pad].transpose(2, 1)
+            last_state = x[:, -self.pad :]
         else:
-            return y[:, :, : -self.pad].transpose(2, 1)
+            out = y.transpose(2, 1)
+            last_state = torch.empty(x.shape[0], 0, x.shape[2], device=x.device, dtype=x.dtype)
+
+        if return_last_state:
+            return out, last_state
+        else:
+            return out
 
     def step(
         self,

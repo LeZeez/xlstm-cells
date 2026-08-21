@@ -5,7 +5,7 @@ mLSTM: Matrix-memory LSTM cell and layer.
 1. Gating from concatenated [q, k, v] vectors (dimension 3 * inner_dim -> 2 * num_heads).
 2. Linspace forget-gate bias init (3.4 to 6.0 across heads) for diverse memory timescales.
 3. Input-gate bias init ~ N(0.0, 0.1).
-4. Matrix memory covariance update with exp-stabilizer m and configurable denominator floor eps (default 1e-3).
+4. Matrix memory covariance update with exp-stabilizer m and configurable denominator floor eps (default 1e-6).
 5. Optional Triton chunkwise kernel backends (xl_chunk and limit_chunk via mlstm_kernels).
 6. Native chunked-parallel scan fallback for CPU, non-divisible sequence lengths, or compilation.
 7. Packed document boundaries reset (f_tilde = -1000.0).
@@ -40,7 +40,7 @@ try:
 except ImportError:
     _HAS_MLSTM_KERNELS = False
 
-_EPS = 1e-3
+_EPS = 1e-6
 _MLSTM_CHUNK_SIZE = 128
 _BOUNDARY_RESET_LOGF = -1000.0
 _MAX_FORGET_BIAS = 4.0
@@ -281,7 +281,7 @@ class mLSTMCell(nn.Module):
         hidden_size: Hidden feature dimension (must be divisible by num_heads).
         num_heads: Number of matrix-memory heads. Default: 4.
         bias: Whether projection layers include bias. Default: False.
-        eps: Denominator stabilizer epsilon. Default: 1e-3.
+        eps: Denominator stabilizer epsilon. Default: 1e-6.
     """
 
     def __init__(self, input_size: int, hidden_size: int, num_heads: int = 4,
@@ -415,7 +415,7 @@ class mLSTM(nn.Module):
         use_triton_kernels: Whether to use Triton kernels from mlstm_kernels if available. Default: True.
         chunkwise_kernel: Name of Triton chunkwise kernel ("limit_chunk" or "xl_chunk"). Default: "xl_chunk".
         chunk_size: Chunk size for chunked parallel scan. Default: 128.
-        eps: Denominator stabilizer epsilon. Default: 1e-3.
+        eps: Denominator stabilizer epsilon. Default: 1e-6.
     """
 
     def __init__(

@@ -116,4 +116,11 @@ def zero_rows(
                     f"zero_rows: tensor '{fname}' requires grad. "
                     f"Detach states first with detach_states()."
                 )
-            tensor[:, mask] = 0
+            if tensor.shape[0] == mask.shape[0]:
+                tensor[mask] = 0
+            elif tensor.dim() > 1 and tensor.shape[1] == mask.shape[0]:
+                tensor[:, mask] = 0
+            else:
+                raise ValueError(
+                    f"zero_rows: tensor '{fname}' shape {list(tensor.shape)} does not match mask length {mask.shape[0]}"
+                )

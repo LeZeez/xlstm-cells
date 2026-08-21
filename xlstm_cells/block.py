@@ -78,7 +78,7 @@ class mLSTMBlock(nn.Module):
         use_triton_kernels: Whether to use mlstm_kernels Triton backend when available. Default: True.
         chunkwise_kernel: Triton chunk kernel name ("limit_chunk" or "xl_chunk"). Default: "xl_chunk".
         chunk_size: Sequence chunk size for chunked scan. Default: 128.
-        eps: Denominator epsilon constant for stabilizer numerical stability. Default: 1e-3.
+        eps: Denominator epsilon constant for stabilizer numerical stability. Default: 1e-6.
         num_blocks: Total number of stacked blocks in the model (for Wang init scaling). Default: 1.
     """
 

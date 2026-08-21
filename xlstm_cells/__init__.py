@@ -36,6 +36,7 @@ from ._utils import (
 from .components.ln import LayerNorm, MultiHeadLayerNorm
 from .components.conv import CausalConv1d, conv1d_step
 from .components.feedforward import GatedFeedForward
+from .components.linear_headwise import LinearHeadwiseExpand
 
 __version__ = "0.6.0"
 __all__ = [
@@ -52,6 +53,7 @@ __all__ = [
     "CausalConv1d",
     "conv1d_step",
     "GatedFeedForward",
+    "LinearHeadwiseExpand",
     "detach_states",
     "zero_rows",
     "PackedBoundariesMode",
