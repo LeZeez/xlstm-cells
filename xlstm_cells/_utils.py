@@ -85,13 +85,13 @@ def detach_states(
 def zero_rows(
     states: Union[Dict, List, Tuple, Any],
     mask: torch.Tensor,
+    batch_dim: Optional[int] = None,
 ) -> None:
     """In-place zero selected batch rows across a nested state structure.
 
     ``mask`` must be a boolean tensor of shape ``(batch_size,)``.
-    For every tensor field inside state dataclasses, ``tensor[:, mask] = 0``
-    is applied --- this zeroes the masked rows while preserving the leading
-    dimension (num_directions) and all other dimensions.
+    Supports both 3D/4D cell & block states ``(B, ...)`` and 4D/5D multi-layer
+    sequence states ``(D, B, ...)``.
 
     .. warning::
         Only call on detached states.  If any tensor in the state is still
@@ -104,10 +104,10 @@ def zero_rows(
     """
     if isinstance(states, dict):
         for v in states.values():
-            zero_rows(v, mask)
+            zero_rows(v, mask, batch_dim=batch_dim)
     elif isinstance(states, (list, tuple)):
         for v in states:
-            zero_rows(v, mask)
+            zero_rows(v, mask, batch_dim=batch_dim)
     elif hasattr(states, "__dataclass_fields__"):
         for fname in states.__dataclass_fields__:
             tensor = getattr(states, fname)
@@ -116,10 +116,14 @@ def zero_rows(
                     f"zero_rows: tensor '{fname}' requires grad. "
                     f"Detach states first with detach_states()."
                 )
-            if tensor.shape[0] == mask.shape[0]:
-                tensor[mask] = 0
-            elif tensor.dim() > 1 and tensor.shape[1] == mask.shape[0]:
+            if batch_dim is not None:
+                idx = [slice(None)] * tensor.dim()
+                idx[batch_dim] = mask
+                tensor[tuple(idx)] = 0
+            elif tensor.dim() in (4, 5) and tensor.shape[1] == mask.shape[0]:
                 tensor[:, mask] = 0
+            elif tensor.shape[0] == mask.shape[0]:
+                tensor[mask] = 0
             else:
                 raise ValueError(
                     f"zero_rows: tensor '{fname}' shape {list(tensor.shape)} does not match mask length {mask.shape[0]}"

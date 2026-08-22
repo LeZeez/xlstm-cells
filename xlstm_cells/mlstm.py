@@ -289,11 +289,13 @@ class mLSTMCell(nn.Module):
         """Initializes single-step mLSTMCell."""
         super().__init__()
         assert hidden_size % num_heads == 0
+        if not isinstance(eps, (int, float)) or isinstance(eps, bool) or not math.isfinite(eps) or eps <= 0:
+            raise ValueError("eps must be a positive finite float")
         self.input_size = input_size
         self.hidden_size = hidden_size
         self.num_heads = num_heads
         self.head_dim = hidden_size // num_heads
-        self.eps = eps
+        self.eps = float(eps)
 
         self.q_proj = nn.Linear(input_size, hidden_size, bias=bias)
         self.k_proj = nn.Linear(input_size, hidden_size, bias=bias)
@@ -443,6 +445,9 @@ class mLSTM(nn.Module):
                 f"mLSTM: unknown chunkwise_kernel {chunkwise_kernel!r}, "
                 f"expected one of {list(_TRITON_CHUNKWISE_KERNELS.keys())}"
             )
+
+        if not isinstance(chunk_size, int) or isinstance(chunk_size, bool) or chunk_size <= 0:
+            raise ValueError(f"chunk_size must be a strictly positive integer, got {chunk_size}")
 
         self.input_size = input_size
         self.hidden_size = hidden_size

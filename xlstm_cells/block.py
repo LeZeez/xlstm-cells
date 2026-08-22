@@ -101,6 +101,19 @@ class mLSTMBlock(nn.Module):
         super().__init__()
         expanded = d_model * expand_factor
         assert expanded % num_heads == 0, f"expanded ({expanded}) must be divisible by num_heads ({num_heads})"
+        if chunkwise_kernel not in _TRITON_CHUNKWISE_KERNELS:
+            raise ValueError(
+                f"mLSTMBlock: unknown chunkwise_kernel {chunkwise_kernel!r}, "
+                f"expected one of {list(_TRITON_CHUNKWISE_KERNELS.keys())}"
+            )
+        if not isinstance(chunk_size, int) or isinstance(chunk_size, bool) or chunk_size <= 0:
+            raise ValueError(f"chunk_size must be a strictly positive integer, got {chunk_size}")
+
+        if eps is None:
+            eps = _EPS
+        if not isinstance(eps, (int, float)) or isinstance(eps, bool) or not math.isfinite(eps) or eps <= 0:
+            raise ValueError("eps must be a positive finite float")
+
         self.d_model = d_model
         self.expanded = expanded
         self.num_heads = num_heads
@@ -110,7 +123,7 @@ class mLSTMBlock(nn.Module):
         self._use_triton_kernels = use_triton_kernels and _HAS_MLSTM_KERNELS
         self._chunkwise_kernel = chunkwise_kernel
         self._chunk_size = chunk_size
-        self._eps = float(eps) if eps is not None else _EPS
+        self._eps = float(eps)
 
         self.ln = LayerNorm(d_model, bias=False)
         self.fused_proj = nn.Linear(d_model, 2 * expanded, bias=bias)
@@ -415,6 +428,7 @@ class sLSTMBlock(nn.Module):
 
         self._compiled_scans = {}
         self._cuda_kernel = None
+        self._cuda_funcs = {}
         if backend == "cuda":
             self._init_cuda_backend()
 
@@ -423,21 +437,11 @@ class sLSTMBlock(nn.Module):
     def _init_cuda_backend(self) -> None:
         """Compiles and loads the official sLSTM CUDA C++ extension."""
         try:
-            from .cuda.cuda_init import load
-            curdir = os.path.dirname(__file__)
-            src_dir = os.path.join(curdir, "cuda")
-            sources = [
-                os.path.join(src_dir, "cuda", "slstm.cc"),
-                os.path.join(src_dir, "cuda", "slstm_forward.cu"),
-                os.path.join(src_dir, "cuda", "slstm_backward.cu"),
-                os.path.join(src_dir, "cuda", "slstm_backward_cut.cu"),
-                os.path.join(src_dir, "cuda", "slstm_pointwise.cu"),
-                os.path.join(src_dir, "util", "blas.cu"),
-                os.path.join(src_dir, "util", "cuda_error.cu"),
-            ]
+            from .cuda.cuda_init import load, get_slstm_cuda_sources
+            sources = get_slstm_cuda_sources()
             self._cuda_kernel = load(name="slstm_cuda", sources=sources)
-        except Exception as e:
-            warnings.warn(f"sLSTMBlock: failed to compile CUDA kernel ({e}). Falling back to backend='vanilla'.")
+        except (RuntimeError, OSError) as e:
+            warnings.warn(f"sLSTMBlock: failed to compile CUDA kernel ({e}). Falling back to backend='vanilla'.", stacklevel=2)
             self.backend = "vanilla"
 
     def reset_parameters(self, num_blocks: int = 1) -> None:
@@ -553,7 +557,11 @@ class sLSTMBlock(nn.Module):
             m.reshape(B, HS)
         ], dim=0).contiguous()
 
-        slstm_func = self._cuda_kernel.sLSTMFunc(self.training, B, HS, Hh)
+        cache_key = (self.training, B, HS, Hh)
+        if cache_key not in self._cuda_funcs:
+            self._cuda_funcs[cache_key] = self._cuda_kernel.sLSTMFunc(self.training, B, HS, Hh)
+        slstm_func = self._cuda_funcs[cache_key]
+
         states_cuda = _sLSTMCudaFunction.apply(slstm_func, self.training, x_cuda, s0_cuda, R_cuda, b_cuda)
 
         out_TBH = states_cuda[0, 1:]

@@ -23,6 +23,7 @@ from dataclasses import dataclass
 from typing import List, Optional, Tuple, Union
 
 import torch
+from torch.autograd.function import once_differentiable
 from torch.utils.checkpoint import checkpoint as _torch_checkpoint
 import torch.nn as nn
 import torch.nn.functional as F
@@ -107,6 +108,7 @@ class _sLSTMCudaFunction(torch.autograd.Function):
         return states
 
     @staticmethod
+    @once_differentiable
     def backward(ctx, grad_states):
         if not ctx.training:
             raise RuntimeError("sLSTM CUDA backward only supported when training=True")
@@ -150,7 +152,7 @@ def _slstm_scan_sequential(
         o = torch.sigmoid(o_tilde)
         log_f = F.logsigmoid(f_tilde)
 
-        m_new = torch.maximum(log_f + m, i_tilde)
+        m_new = torch.where(n == 0.0, i_tilde, torch.maximum(log_f + m, i_tilde))
         # Gate clamping to <= 1.0 (paper compliance)
         i_prime = torch.minimum(torch.exp(i_tilde - m_new), torch.ones_like(i_tilde))
         f_prime = torch.minimum(torch.exp(log_f + m - m_new), torch.ones_like(i_tilde))
@@ -257,7 +259,7 @@ class sLSTMCell(nn.Module):
         o = torch.sigmoid(o_tilde)
         log_f = F.logsigmoid(f_tilde)
 
-        m_new = torch.maximum(log_f + state.m, i_tilde)
+        m_new = torch.where(state.n == 0.0, i_tilde, torch.maximum(log_f + state.m, i_tilde))
         i_prime = torch.minimum(torch.exp(i_tilde - m_new), torch.ones_like(i_tilde))
         f_prime = torch.minimum(torch.exp(log_f + state.m - m_new), torch.ones_like(i_tilde))
 
@@ -347,6 +349,7 @@ class sLSTM(nn.Module):
         self.fast_chunk_size = fast_chunk_size
 
         self._cuda_kernel = None
+        self._cuda_funcs = {}
         if backend == "cuda":
             self._init_cuda_backend()
 
@@ -375,21 +378,11 @@ class sLSTM(nn.Module):
     def _init_cuda_backend(self) -> None:
         """Compiles and loads the official sLSTM CUDA C++ extension."""
         try:
-            from .cuda.cuda_init import load
-            curdir = os.path.dirname(__file__)
-            src_dir = os.path.join(curdir, "cuda")
-            sources = [
-                os.path.join(src_dir, "cuda", "slstm.cc"),
-                os.path.join(src_dir, "cuda", "slstm_forward.cu"),
-                os.path.join(src_dir, "cuda", "slstm_backward.cu"),
-                os.path.join(src_dir, "cuda", "slstm_backward_cut.cu"),
-                os.path.join(src_dir, "cuda", "slstm_pointwise.cu"),
-                os.path.join(src_dir, "util", "blas.cu"),
-                os.path.join(src_dir, "util", "cuda_error.cu"),
-            ]
+            from .cuda.cuda_init import load, get_slstm_cuda_sources
+            sources = get_slstm_cuda_sources()
             self._cuda_kernel = load(name="slstm_cuda", sources=sources)
-        except Exception as e:
-            warnings.warn(f"sLSTM: failed to compile CUDA kernel ({e}). Falling back to backend='vanilla'.")
+        except (RuntimeError, OSError) as e:
+            warnings.warn(f"sLSTM: failed to compile CUDA kernel ({e}). Falling back to backend='vanilla'.", stacklevel=2)
             self.backend = "vanilla"
 
     def reset_parameters(self) -> None:
@@ -533,7 +526,11 @@ class sLSTM(nn.Module):
             m.reshape(B, HS)
         ], dim=0).contiguous()
 
-        slstm_func = self._cuda_kernel.sLSTMFunc(self.training, B, HS, Hh)
+        cache_key = (self.training, B, HS, Hh)
+        if cache_key not in self._cuda_funcs:
+            self._cuda_funcs[cache_key] = self._cuda_kernel.sLSTMFunc(self.training, B, HS, Hh)
+        slstm_func = self._cuda_funcs[cache_key]
+
         states_cuda = _sLSTMCudaFunction.apply(slstm_func, self.training, x_cuda, s0_cuda, R_cuda, b_cuda)
 
         out_TBH = states_cuda[0, 1:]

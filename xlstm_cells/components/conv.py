@@ -136,7 +136,17 @@ class CausalConv1d(nn.Module):
         assert S == 1
         if conv_state is None:
             conv_state = torch.zeros(B, self.kernel_size, D, device=x.device, dtype=x.dtype)
-        # Weight shape in depthwise Conv1d: (D, 1, KS) -> transpose to (KS, D)
-        w = self.conv.weight.squeeze(1).transpose(0, 1)
-        b = self.conv.bias
-        return conv1d_step(x, conv_state, w, b)
+
+        if self.groups == 1:
+            # Channel mixing: conv weight shape is (out_channels, in_channels, KS)
+            new_conv_state = torch.roll(conv_state, shifts=-1, dims=1)
+            new_conv_state[:, -1:, :] = x
+            y = torch.einsum("bki,oik->bo", new_conv_state, self.conv.weight)
+            if self.conv.bias is not None:
+                y = y + self.conv.bias
+            return y.unsqueeze(1), new_conv_state
+        else:
+            # Depthwise convolution: weight shape is (D, 1, KS) -> transpose to (KS, D)
+            w = self.conv.weight.squeeze(1).transpose(0, 1)
+            b = self.conv.bias
+            return conv1d_step(x, conv_state, w, b)
