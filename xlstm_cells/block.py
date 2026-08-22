@@ -105,6 +105,8 @@ class mLSTMBlock(nn.Module):
                 "mLSTMBlock: conflicting arguments: cannot specify both 'expand_factor' and 'hidden_size'. "
                 "Specify only one."
             )
+        if not isinstance(num_heads, int) or isinstance(num_heads, bool) or num_heads <= 0:
+            raise ValueError(f"mLSTMBlock: num_heads must be a strictly positive integer, got {num_heads}")
         if hidden_size is not None:
             if not isinstance(hidden_size, int) or isinstance(hidden_size, bool) or hidden_size <= 0:
                 raise ValueError(f"mLSTMBlock: hidden_size must be a strictly positive integer, got {hidden_size}")

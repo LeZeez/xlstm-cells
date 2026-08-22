@@ -145,6 +145,10 @@ def normalize_and_validate_num_heads(
     class_name: str,
 ) -> List[int]:
     """Validates and normalizes num_heads into a list of ints per layer."""
+    if not isinstance(num_layers, int) or isinstance(num_layers, bool) or num_layers <= 0:
+        raise ValueError(f"{class_name}: num_layers must be a strictly positive integer, got {num_layers}")
+    if not isinstance(hidden_size, int) or isinstance(hidden_size, bool) or hidden_size <= 0:
+        raise ValueError(f"{class_name}: hidden_size must be a strictly positive integer, got {hidden_size}")
     if isinstance(num_heads, int) and not isinstance(num_heads, bool):
         if num_heads <= 0:
             raise ValueError(f"{class_name}: num_heads must be a strictly positive integer, got {num_heads}")
