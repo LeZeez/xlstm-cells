@@ -110,13 +110,18 @@ class mLSTMBlock(nn.Module):
                 raise ValueError(f"mLSTMBlock: hidden_size must be a strictly positive integer, got {hidden_size}")
             expanded = hidden_size
         elif expand_factor is not None:
-            if not isinstance(expand_factor, (int, float)) or isinstance(expand_factor, bool) or expand_factor <= 0:
-                raise ValueError(f"mLSTMBlock: expand_factor must be a strictly positive number, got {expand_factor}")
+            if not isinstance(expand_factor, (int, float)) or isinstance(expand_factor, bool) or not math.isfinite(expand_factor) or expand_factor <= 0:
+                raise ValueError(f"mLSTMBlock: expand_factor must be a positive finite number, got {expand_factor}")
             expanded = round(expand_factor * d_model)
         else:
             expanded = 2 * d_model  # Paper default (factor 2)
 
-        assert expanded % num_heads == 0, f"expanded ({expanded}) must be divisible by num_heads ({num_heads})"
+        if expanded <= 0:
+            raise ValueError(f"mLSTMBlock: resolved hidden dimension must be strictly positive, got {expanded}")
+        if expanded % num_heads != 0:
+            raise ValueError(
+                f"mLSTMBlock: hidden dimension ({expanded}) must be divisible by num_heads ({num_heads})"
+            )
         if chunkwise_kernel not in _TRITON_CHUNKWISE_KERNELS:
             raise ValueError(
                 f"mLSTMBlock: unknown chunkwise_kernel {chunkwise_kernel!r}, "
@@ -403,7 +408,12 @@ class sLSTMBlock(nn.Module):
     ):
         """Initializes paper-compliant sLSTMBlock."""
         super().__init__()
-        assert d_model % num_heads == 0, f"d_model ({d_model}) must be divisible by num_heads ({num_heads})"
+        if not isinstance(d_model, int) or isinstance(d_model, bool) or d_model <= 0:
+            raise ValueError(f"sLSTMBlock: d_model must be a positive integer, got {d_model}")
+        if not isinstance(num_heads, int) or isinstance(num_heads, bool) or num_heads <= 0:
+            raise ValueError(f"sLSTMBlock: num_heads must be a positive integer, got {num_heads}")
+        if d_model % num_heads != 0:
+            raise ValueError(f"sLSTMBlock: d_model ({d_model}) must be divisible by num_heads ({num_heads})")
         if backend == "cuda" and fast_mode:
             raise ValueError("sLSTMBlock: backend='cuda' cannot be combined with fast_mode=True.")
         if backend not in ("vanilla", "cuda"):

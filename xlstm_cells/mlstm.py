@@ -27,6 +27,7 @@ import torch.nn.functional as F
 from ._utils import (
     PackedBoundariesMode,
     get_packed_boundaries_override_mode,
+    normalize_and_validate_num_heads,
 )
 from .components.init import bias_linspace_init_, small_init_init_, wang_init_
 from .components.ln import MultiHeadLayerNorm
@@ -288,7 +289,14 @@ class mLSTMCell(nn.Module):
                  bias: bool = False, eps: float = _EPS):
         """Initializes single-step mLSTMCell."""
         super().__init__()
-        assert hidden_size % num_heads == 0
+        if not isinstance(input_size, int) or isinstance(input_size, bool) or input_size <= 0:
+            raise ValueError(f"mLSTMCell: input_size must be a positive integer, got {input_size}")
+        if not isinstance(hidden_size, int) or isinstance(hidden_size, bool) or hidden_size <= 0:
+            raise ValueError(f"mLSTMCell: hidden_size must be a positive integer, got {hidden_size}")
+        if not isinstance(num_heads, int) or isinstance(num_heads, bool) or num_heads <= 0:
+            raise ValueError(f"mLSTMCell: num_heads must be a positive integer, got {num_heads}")
+        if hidden_size % num_heads != 0:
+            raise ValueError(f"mLSTMCell: hidden_size ({hidden_size}) must be divisible by num_heads ({num_heads})")
         if not isinstance(eps, (int, float)) or isinstance(eps, bool) or not math.isfinite(eps) or eps <= 0:
             raise ValueError("eps must be a positive finite float")
         self.input_size = input_size
@@ -425,7 +433,7 @@ class mLSTM(nn.Module):
         input_size: int,
         hidden_size: int,
         num_layers: int = 1,
-        num_heads: int = 4,
+        num_heads: Union[int, List[int], Tuple[int, ...]] = 4,
         bias: bool = False,
         batch_first: bool = True,
         dropout: float = 0.0,
@@ -439,7 +447,7 @@ class mLSTM(nn.Module):
     ):
         """Initializes multi-layer mLSTM sequence model."""
         super().__init__()
-        assert hidden_size % num_heads == 0
+        heads_list = normalize_and_validate_num_heads(num_heads, num_layers, hidden_size, "mLSTM")
         if chunkwise_kernel not in _TRITON_CHUNKWISE_KERNELS:
             raise ValueError(
                 f"mLSTM: unknown chunkwise_kernel {chunkwise_kernel!r}, "
@@ -452,7 +460,7 @@ class mLSTM(nn.Module):
         self.input_size = input_size
         self.hidden_size = hidden_size
         self.num_layers = num_layers
-        self.num_heads = [num_heads] * num_layers if isinstance(num_heads, int) else num_heads
+        self.num_heads = heads_list
         self.bias = bias
         self.batch_first = batch_first
         self.dropout = dropout

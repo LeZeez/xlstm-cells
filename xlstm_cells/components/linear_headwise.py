@@ -31,7 +31,13 @@ class LinearHeadwiseExpand(nn.Module):
     ):
         """Initializes headwise linear expansion layer."""
         super().__init__()
-        assert in_features % num_heads == 0, f"in_features ({in_features}) must be divisible by num_heads ({num_heads})"
+        if not isinstance(in_features, int) or isinstance(in_features, bool) or in_features <= 0:
+            raise ValueError(f"LinearHeadwiseExpand: in_features must be a positive integer, got {in_features}")
+        if not isinstance(num_heads, int) or isinstance(num_heads, bool) or num_heads <= 0:
+            raise ValueError(f"LinearHeadwiseExpand: num_heads must be a positive integer, got {num_heads}")
+        if in_features % num_heads != 0:
+            raise ValueError(f"LinearHeadwiseExpand: in_features ({in_features}) must be divisible by num_heads ({num_heads})")
+
         if expand_factor is not None and out_features is not None:
             raise ValueError(
                 "LinearHeadwiseExpand: conflicting arguments: cannot specify both 'expand_factor' and 'out_features'. "
@@ -44,19 +50,23 @@ class LinearHeadwiseExpand(nn.Module):
                 raise ValueError(f"LinearHeadwiseExpand: out_features must be a strictly positive integer, got {out_features}")
             self.out_features = out_features
         elif expand_factor is not None:
-            if not isinstance(expand_factor, (int, float)) or isinstance(expand_factor, bool) or expand_factor <= 0:
-                raise ValueError(f"LinearHeadwiseExpand: expand_factor must be a positive number, got {expand_factor}")
+            if not isinstance(expand_factor, (int, float)) or isinstance(expand_factor, bool) or not math.isfinite(expand_factor) or expand_factor <= 0:
+                raise ValueError(f"LinearHeadwiseExpand: expand_factor must be a positive finite number, got {expand_factor}")
             self.out_features = round(expand_factor * in_features)
         else:
             self.out_features = in_features
-        assert self.out_features % num_heads == 0, f"out_features ({self.out_features}) must be divisible by num_heads ({num_heads})"
 
-        in_per_head = in_features // num_heads
-        out_per_head = out_features // num_heads
+        if self.out_features <= 0:
+            raise ValueError(f"LinearHeadwiseExpand: resolved out_features must be strictly positive, got {self.out_features}")
+        if self.out_features % num_heads != 0:
+            raise ValueError(f"LinearHeadwiseExpand: out_features ({self.out_features}) must be divisible by num_heads ({num_heads})")
+
+        in_per_head = self.in_features // self.num_heads
+        out_per_head = self.out_features // self.num_heads
 
         self.weight = nn.Parameter(torch.empty(num_heads, out_per_head, in_per_head))
         if bias:
-            self.bias = nn.Parameter(torch.empty(out_features))
+            self.bias = nn.Parameter(torch.empty(self.out_features))
         else:
             self.bias = None
         self.reset_parameters()

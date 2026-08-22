@@ -38,6 +38,11 @@ class GatedFeedForward(nn.Module):
     ):
         """Initializes GatedFeedForward layer."""
         super().__init__()
+        if proj_up_dim is not None and hidden_size is not None:
+            raise ValueError(
+                "GatedFeedForward: conflicting arguments: cannot specify both 'proj_up_dim' and 'hidden_size'. "
+                "Specify only one."
+            )
         explicit_up = proj_up_dim if proj_up_dim is not None else hidden_size
         if proj_factor is not None and explicit_up is not None:
             raise ValueError(
@@ -49,11 +54,14 @@ class GatedFeedForward(nn.Module):
                 raise ValueError(f"GatedFeedForward: proj_up_dim must be a strictly positive integer, got {explicit_up}")
             self.proj_up_dim = explicit_up
         elif proj_factor is not None:
-            if not isinstance(proj_factor, (int, float)) or isinstance(proj_factor, bool) or proj_factor <= 0:
-                raise ValueError(f"GatedFeedForward: proj_factor must be a positive number, got {proj_factor}")
+            if not isinstance(proj_factor, (int, float)) or isinstance(proj_factor, bool) or not math.isfinite(proj_factor) or proj_factor <= 0:
+                raise ValueError(f"GatedFeedForward: proj_factor must be a positive finite number, got {proj_factor}")
             self.proj_up_dim = round(proj_factor * d_model)
         else:
             self.proj_up_dim = round((4.0 / 3.0) * d_model)
+
+        if self.proj_up_dim <= 0:
+            raise ValueError(f"GatedFeedForward: computed proj_up_dim must be strictly positive, got {self.proj_up_dim}")
 
         self.d_model = d_model
         self.act_fn = act_fn

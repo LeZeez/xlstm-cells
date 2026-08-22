@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import torch
 from enum import Enum
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 
 # ---------------------------------------------------------------------------
@@ -136,3 +136,34 @@ def zero_rows(
                     raise ValueError(
                         f"zero_rows: tensor '{fname}' shape {list(tensor.shape)} does not match mask length {mask.shape[0]}"
                     )
+
+
+def normalize_and_validate_num_heads(
+    num_heads: Union[int, Sequence[int]],
+    num_layers: int,
+    hidden_size: int,
+    class_name: str,
+) -> List[int]:
+    """Validates and normalizes num_heads into a list of ints per layer."""
+    if isinstance(num_heads, int) and not isinstance(num_heads, bool):
+        if num_heads <= 0:
+            raise ValueError(f"{class_name}: num_heads must be a strictly positive integer, got {num_heads}")
+        heads_list = [num_heads] * num_layers
+    elif isinstance(num_heads, (list, tuple)):
+        if len(num_heads) != num_layers:
+            raise ValueError(
+                f"{class_name}: length of num_heads ({len(num_heads)}) must match num_layers ({num_layers})"
+            )
+        for h in num_heads:
+            if not isinstance(h, int) or isinstance(h, bool) or h <= 0:
+                raise ValueError(f"{class_name}: every element of num_heads must be a positive integer, got {h}")
+        heads_list = list(num_heads)
+    else:
+        raise TypeError(f"{class_name}: num_heads must be an integer or a sequence of integers, got {type(num_heads)}")
+
+    for idx, h in enumerate(heads_list):
+        if hidden_size % h != 0:
+            raise ValueError(
+                f"{class_name}: hidden_size ({hidden_size}) must be divisible by num_heads at layer {idx} ({h})"
+            )
+    return heads_list

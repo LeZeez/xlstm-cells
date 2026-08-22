@@ -31,6 +31,7 @@ import torch.nn.functional as F
 from ._utils import (
     PackedBoundariesMode,
     get_packed_boundaries_override_mode,
+    normalize_and_validate_num_heads,
 )
 from .components.init import bias_linspace_init_, small_init_init_
 from .mlstm import _MAX_FORGET_BIAS
@@ -197,7 +198,14 @@ class sLSTMCell(nn.Module):
                  bias: bool = True):
         """Initializes single-step sLSTMCell."""
         super().__init__()
-        assert hidden_size % num_heads == 0
+        if not isinstance(input_size, int) or isinstance(input_size, bool) or input_size <= 0:
+            raise ValueError(f"sLSTMCell: input_size must be a positive integer, got {input_size}")
+        if not isinstance(hidden_size, int) or isinstance(hidden_size, bool) or hidden_size <= 0:
+            raise ValueError(f"sLSTMCell: hidden_size must be a positive integer, got {hidden_size}")
+        if not isinstance(num_heads, int) or isinstance(num_heads, bool) or num_heads <= 0:
+            raise ValueError(f"sLSTMCell: num_heads must be a positive integer, got {num_heads}")
+        if hidden_size % num_heads != 0:
+            raise ValueError(f"sLSTMCell: hidden_size ({hidden_size}) must be divisible by num_heads ({num_heads})")
         self.input_size = input_size
         self.hidden_size = hidden_size
         self.num_heads = num_heads
@@ -308,7 +316,7 @@ class sLSTM(nn.Module):
         input_size: int,
         hidden_size: int,
         num_layers: int = 1,
-        num_heads: int = 4,
+        num_heads: Union[int, List[int], Tuple[int, ...]] = 4,
         bias: bool = True,
         batch_first: bool = True,
         dropout: float = 0.0,
@@ -321,7 +329,7 @@ class sLSTM(nn.Module):
     ):
         """Initializes multi-layer sLSTM sequence model."""
         super().__init__()
-        assert hidden_size % num_heads == 0
+        heads_list = normalize_and_validate_num_heads(num_heads, num_layers, hidden_size, "sLSTM")
 
         # Hard-block invalid backend/mode overlaps
         if backend == "cuda" and fast_mode:
@@ -341,7 +349,7 @@ class sLSTM(nn.Module):
         self.input_size = input_size
         self.hidden_size = hidden_size
         self.num_layers = num_layers
-        self.num_heads = [num_heads] * num_layers if isinstance(num_heads, int) else num_heads
+        self.num_heads = heads_list
         self.bias = bias
         self.batch_first = batch_first
         self.dropout = dropout
