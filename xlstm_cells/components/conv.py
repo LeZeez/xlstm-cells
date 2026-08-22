@@ -17,20 +17,19 @@ def conv1d_step(
     """Single step of causal 1D depthwise convolution.
     Args:
         x: (B, 1, D)
-        conv_state: (B, KS, D)
+        conv_state: (B, KS-1, D) left context buffer
         conv1d_weight: (KS, D)
     Returns:
-        y: (B, 1, D), new_conv_state: (B, KS, D)
+        y: (B, 1, D), new_conv_state: (B, KS-1, D)
     """
     assert x.shape[0] == conv_state.shape[0]
     assert x.shape[2] == conv_state.shape[2]
     assert x.shape[1] == 1
-    new_conv_state = conv_state.clone()
-    new_conv_state = torch.roll(new_conv_state, shifts=-1, dims=1)
-    new_conv_state[:, -1:, :] = x
-    y = torch.sum(new_conv_state * conv1d_weight, dim=1, keepdim=True)
+    full_context = torch.cat([conv_state, x], dim=1)
+    y = torch.sum(full_context * conv1d_weight, dim=1, keepdim=True)
     if conv1d_bias is not None:
         y += conv1d_bias
+    new_conv_state = full_context[:, 1:] if full_context.shape[1] > 1 else torch.empty(x.shape[0], 0, x.shape[2], device=x.device, dtype=x.dtype)
     return y, new_conv_state
 
 
@@ -125,25 +124,25 @@ class CausalConv1d(nn.Module):
 
         Args:
             x: Input token tensor of shape (B, 1, D).
-            conv_state: Previous state buffer of shape (B, KS, D).
+            conv_state: Previous left-context buffer of shape (B, KS-1, D).
 
         Returns:
-            Tuple of (output token tensor of shape (B, 1, D), updated conv_state).
+            Tuple of (output token tensor of shape (B, 1, D), updated left-context conv_state of shape (B, KS-1, D)).
         """
-        if self.conv is None:
+        if self.conv is None or self.kernel_size == 0:
             return x, None
         B, S, D = x.shape
         assert S == 1
         if conv_state is None:
-            conv_state = torch.zeros(B, self.kernel_size, D, device=x.device, dtype=x.dtype)
+            conv_state = torch.zeros(B, self.pad, D, device=x.device, dtype=x.dtype)
 
         if self.groups == 1:
             # Channel mixing: conv weight shape is (out_channels, in_channels, KS)
-            new_conv_state = torch.roll(conv_state, shifts=-1, dims=1)
-            new_conv_state[:, -1:, :] = x
-            y = torch.einsum("bki,oik->bo", new_conv_state, self.conv.weight)
+            full_context = torch.cat([conv_state, x], dim=1)
+            y = torch.einsum("bki,oik->bo", full_context, self.conv.weight)
             if self.conv.bias is not None:
                 y = y + self.conv.bias
+            new_conv_state = full_context[:, 1:] if self.pad > 0 else torch.empty(B, 0, D, device=x.device, dtype=x.dtype)
             return y.unsqueeze(1), new_conv_state
         else:
             # Depthwise convolution: weight shape is (D, 1, KS) -> transpose to (KS, D)

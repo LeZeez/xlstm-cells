@@ -58,7 +58,7 @@ if "CONDA_PREFIX" in os.environ:
 
 def get_slstm_cuda_sources() -> list[str]:
     """Returns absolute paths to all sLSTM C++/CUDA extension sources."""
-    src_dir = os.path.dirname(__file__)
+    src_dir = os.path.abspath(os.path.dirname(__file__))
     return [
         os.path.join(src_dir, "cuda", "slstm.cc"),
         os.path.join(src_dir, "cuda", "slstm_forward.cu"),
