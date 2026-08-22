@@ -7,6 +7,7 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 
+from typing import Optional
 from .init import small_init_init_, wang_init_
 
 
@@ -15,26 +16,46 @@ class GatedFeedForward(nn.Module):
 
     Args:
         d_model: Model hidden dimension.
-        proj_factor: Projection expansion factor. Default: 4.0 / 3.0.
+        proj_factor: Projection expansion factor. If None and proj_up_dim is None, defaults to 4.0 / 3.0.
         act_fn: Activation function ("gelu", "silu", "swish", "relu"). Default: "gelu".
         dropout: Dropout probability. Default: 0.0.
         bias: Whether linear projections use bias. Default: False.
         num_blocks: Number of stacked blocks in the model (for Wang init scaling). Default: 1.
+        proj_up_dim: Explicit projection up dimension. Cannot be combined with proj_factor.
+        hidden_size: Alias for proj_up_dim.
     """
 
     def __init__(
         self,
         d_model: int,
-        proj_factor: float = 4.0 / 3.0,
+        proj_factor: Optional[float] = None,
         act_fn: str = "gelu",
         dropout: float = 0.0,
         bias: bool = False,
         num_blocks: int = 1,
+        proj_up_dim: Optional[int] = None,
+        hidden_size: Optional[int] = None,
     ):
         """Initializes GatedFeedForward layer."""
         super().__init__()
+        explicit_up = proj_up_dim if proj_up_dim is not None else hidden_size
+        if proj_factor is not None and explicit_up is not None:
+            raise ValueError(
+                "GatedFeedForward: conflicting arguments: cannot specify both 'proj_factor' and 'proj_up_dim'/'hidden_size'. "
+                "Specify only one."
+            )
+        if explicit_up is not None:
+            if not isinstance(explicit_up, int) or isinstance(explicit_up, bool) or explicit_up <= 0:
+                raise ValueError(f"GatedFeedForward: proj_up_dim must be a strictly positive integer, got {explicit_up}")
+            self.proj_up_dim = explicit_up
+        elif proj_factor is not None:
+            if not isinstance(proj_factor, (int, float)) or isinstance(proj_factor, bool) or proj_factor <= 0:
+                raise ValueError(f"GatedFeedForward: proj_factor must be a positive number, got {proj_factor}")
+            self.proj_up_dim = round(proj_factor * d_model)
+        else:
+            self.proj_up_dim = round((4.0 / 3.0) * d_model)
+
         self.d_model = d_model
-        self.proj_up_dim = round(proj_factor * d_model)
         self.act_fn = act_fn
         self.num_blocks = num_blocks
 

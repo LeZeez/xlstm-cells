@@ -95,6 +95,14 @@ class CausalConv1d(nn.Module):
         if self.conv is None or self.kernel_size == 0:
             return (x, None) if return_last_state else x
 
+        if x.shape[1] == 0:
+            if conv_state is not None:
+                last_state = conv_state
+            else:
+                last_state = torch.zeros(x.shape[0], self.pad, x.shape[2], device=x.device, dtype=x.dtype)
+            out = torch.empty(x.shape[0], 0, x.shape[2], device=x.device, dtype=x.dtype)
+            return (out, last_state) if return_last_state else out
+
         if conv_state is not None:
             x = torch.cat([conv_state, x], dim=1)
 
@@ -105,7 +113,12 @@ class CausalConv1d(nn.Module):
 
         if self.pad > 0:
             out = y[:, :, : -self.pad].transpose(2, 1)
-            last_state = x[:, -self.pad :]
+            if x.shape[1] < self.pad:
+                pad_len = self.pad - x.shape[1]
+                zero_pad = torch.zeros(x.shape[0], pad_len, x.shape[2], device=x.device, dtype=x.dtype)
+                last_state = torch.cat([zero_pad, x], dim=1)
+            else:
+                last_state = x[:, -self.pad :]
         else:
             out = y.transpose(2, 1)
             last_state = torch.empty(x.shape[0], 0, x.shape[2], device=x.device, dtype=x.dtype)

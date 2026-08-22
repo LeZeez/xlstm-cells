@@ -85,7 +85,7 @@ class mLSTMBlock(nn.Module):
     def __init__(
         self,
         d_model: int,
-        expand_factor: int = 2,
+        expand_factor: Optional[float] = None,
         num_heads: int = 4,
         conv_kernel: int = 4,
         dropout: float = 0.0,
@@ -96,10 +96,26 @@ class mLSTMBlock(nn.Module):
         chunk_size: int = _MLSTM_CHUNK_SIZE,
         eps: Optional[float] = None,
         num_blocks: int = 1,
+        hidden_size: Optional[int] = None,
     ):
         """Initializes paper-compliant mLSTMBlock."""
         super().__init__()
-        expanded = d_model * expand_factor
+        if expand_factor is not None and hidden_size is not None:
+            raise ValueError(
+                "mLSTMBlock: conflicting arguments: cannot specify both 'expand_factor' and 'hidden_size'. "
+                "Specify only one."
+            )
+        if hidden_size is not None:
+            if not isinstance(hidden_size, int) or isinstance(hidden_size, bool) or hidden_size <= 0:
+                raise ValueError(f"mLSTMBlock: hidden_size must be a strictly positive integer, got {hidden_size}")
+            expanded = hidden_size
+        elif expand_factor is not None:
+            if not isinstance(expand_factor, (int, float)) or isinstance(expand_factor, bool) or expand_factor <= 0:
+                raise ValueError(f"mLSTMBlock: expand_factor must be a strictly positive number, got {expand_factor}")
+            expanded = round(expand_factor * d_model)
+        else:
+            expanded = 2 * d_model  # Paper default (factor 2)
+
         assert expanded % num_heads == 0, f"expanded ({expanded}) must be divisible by num_heads ({num_heads})"
         if chunkwise_kernel not in _TRITON_CHUNKWISE_KERNELS:
             raise ValueError(
@@ -375,7 +391,7 @@ class sLSTMBlock(nn.Module):
         d_model: int,
         num_heads: int = 4,
         conv_kernel: int = 4,
-        mlp_factor: float = 4.0 / 3.0,
+        mlp_factor: Optional[float] = None,
         dropout: float = 0.0,
         bias: bool = True,
         backend: str = "vanilla",
@@ -383,6 +399,7 @@ class sLSTMBlock(nn.Module):
         fast_mode: bool = False,
         fast_chunk_size: int = 32,
         num_blocks: int = 1,
+        hidden_size: Optional[int] = None,
     ):
         """Initializes paper-compliant sLSTMBlock."""
         super().__init__()
@@ -391,6 +408,17 @@ class sLSTMBlock(nn.Module):
             raise ValueError("sLSTMBlock: backend='cuda' cannot be combined with fast_mode=True.")
         if backend not in ("vanilla", "cuda"):
             raise ValueError(f"sLSTMBlock: unknown backend '{backend}'. Must be 'vanilla' or 'cuda'.")
+        if fast_mode:
+            if not isinstance(fast_chunk_size, int) or isinstance(fast_chunk_size, bool) or fast_chunk_size <= 0:
+                raise ValueError(
+                    f"sLSTMBlock: fast_chunk_size must be a strictly positive integer when fast_mode=True, got {fast_chunk_size}."
+                )
+
+        if mlp_factor is not None and hidden_size is not None:
+            raise ValueError(
+                "sLSTMBlock: conflicting arguments: cannot specify both 'mlp_factor' and 'hidden_size'. "
+                "Specify only one."
+            )
 
         self.d_model = d_model
         self.num_heads = num_heads
@@ -418,7 +446,8 @@ class sLSTMBlock(nn.Module):
         self.ffn_norm = LayerNorm(d_model, bias=False)
         self.ffn = GatedFeedForward(
             d_model=d_model,
-            proj_factor=mlp_factor,
+            proj_factor=mlp_factor if hidden_size is None else None,
+            proj_up_dim=hidden_size,
             act_fn="gelu",
             dropout=dropout,
             bias=bias,
@@ -557,7 +586,7 @@ class sLSTMBlock(nn.Module):
             m.reshape(B, HS)
         ], dim=0).contiguous()
 
-        cache_key = (self.training, B, HS, Hh)
+        cache_key = (self.training, B, HS, Hh, all_in.device)
         if cache_key not in self._cuda_funcs:
             self._cuda_funcs[cache_key] = self._cuda_kernel.sLSTMFunc(self.training, B, HS, Hh)
         slstm_func = self._cuda_funcs[cache_key]

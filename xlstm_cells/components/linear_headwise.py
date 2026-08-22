@@ -26,18 +26,30 @@ class LinearHeadwiseExpand(nn.Module):
         in_features: int,
         num_heads: int,
         out_features: Optional[int] = None,
-        expand_factor: float = 1.0,
+        expand_factor: Optional[float] = None,
         bias: bool = True,
     ):
         """Initializes headwise linear expansion layer."""
         super().__init__()
         assert in_features % num_heads == 0, f"in_features ({in_features}) must be divisible by num_heads ({num_heads})"
+        if expand_factor is not None and out_features is not None:
+            raise ValueError(
+                "LinearHeadwiseExpand: conflicting arguments: cannot specify both 'expand_factor' and 'out_features'. "
+                "Specify only one."
+            )
         self.in_features = in_features
         self.num_heads = num_heads
-        if out_features is None:
-            out_features = round(expand_factor * in_features)
-        assert out_features % num_heads == 0, f"out_features ({out_features}) must be divisible by num_heads ({num_heads})"
-        self.out_features = out_features
+        if out_features is not None:
+            if not isinstance(out_features, int) or isinstance(out_features, bool) or out_features <= 0:
+                raise ValueError(f"LinearHeadwiseExpand: out_features must be a strictly positive integer, got {out_features}")
+            self.out_features = out_features
+        elif expand_factor is not None:
+            if not isinstance(expand_factor, (int, float)) or isinstance(expand_factor, bool) or expand_factor <= 0:
+                raise ValueError(f"LinearHeadwiseExpand: expand_factor must be a positive number, got {expand_factor}")
+            self.out_features = round(expand_factor * in_features)
+        else:
+            self.out_features = in_features
+        assert self.out_features % num_heads == 0, f"out_features ({self.out_features}) must be divisible by num_heads ({num_heads})"
 
         in_per_head = in_features // num_heads
         out_per_head = out_features // num_heads

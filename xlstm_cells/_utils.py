@@ -120,11 +120,19 @@ def zero_rows(
                 idx = [slice(None)] * tensor.dim()
                 idx[batch_dim] = mask
                 tensor[tuple(idx)] = 0
-            elif tensor.dim() in (4, 5) and tensor.shape[1] == mask.shape[0]:
-                tensor[:, mask] = 0
-            elif tensor.shape[0] == mask.shape[0]:
-                tensor[mask] = 0
             else:
-                raise ValueError(
-                    f"zero_rows: tensor '{fname}' shape {list(tensor.shape)} does not match mask length {mask.shape[0]}"
-                )
+                dim0_match = (tensor.shape[0] == mask.shape[0])
+                dim1_match = (tensor.dim() in (4, 5) and tensor.shape[1] == mask.shape[0])
+                if dim0_match and dim1_match:
+                    raise ValueError(
+                        f"zero_rows: ambiguous batch dimension for tensor '{fname}' with shape {list(tensor.shape)} "
+                        f"(both dim 0 and dim 1 match mask length {mask.shape[0]}). Specify batch_dim explicitly."
+                    )
+                elif dim1_match:
+                    tensor[:, mask] = 0
+                elif dim0_match:
+                    tensor[mask] = 0
+                else:
+                    raise ValueError(
+                        f"zero_rows: tensor '{fname}' shape {list(tensor.shape)} does not match mask length {mask.shape[0]}"
+                    )

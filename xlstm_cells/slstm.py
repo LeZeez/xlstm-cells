@@ -332,6 +332,11 @@ class sLSTM(nn.Module):
             )
         if backend not in ("vanilla", "cuda"):
             raise ValueError(f"sLSTM: unknown backend '{backend}'. Must be 'vanilla' or 'cuda'.")
+        if fast_mode:
+            if not isinstance(fast_chunk_size, int) or isinstance(fast_chunk_size, bool) or fast_chunk_size <= 0:
+                raise ValueError(
+                    f"sLSTM: fast_chunk_size must be a strictly positive integer when fast_mode=True, got {fast_chunk_size}."
+                )
 
         self.input_size = input_size
         self.hidden_size = hidden_size
@@ -526,7 +531,7 @@ class sLSTM(nn.Module):
             m.reshape(B, HS)
         ], dim=0).contiguous()
 
-        cache_key = (self.training, B, HS, Hh)
+        cache_key = (self.training, B, HS, Hh, x.device)
         if cache_key not in self._cuda_funcs:
             self._cuda_funcs[cache_key] = self._cuda_kernel.sLSTMFunc(self.training, B, HS, Hh)
         slstm_func = self._cuda_funcs[cache_key]
