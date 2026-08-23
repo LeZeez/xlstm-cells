@@ -142,11 +142,18 @@ def _slstm_scan_sequential(
     b_dev = boundaries.to(device=all_in.device, dtype=torch.bool) if boundaries is not None else None
 
     for t in range(T):
+        if b_dev is not None:
+            b_t = b_dev[:, t].view(B, 1, 1)
+            # Mask out incoming hidden state at document boundary tokens before
+            # the recurrent projection (R_fused @ h) to prevent cross-document
+            # activation and gradient leakage into new document candidate gates.
+            h = torch.where(b_t, torch.zeros_like(h), h)
+
         all_tilde = all_in[:, t] + torch.einsum("bhd,hde->bhe", h, R_fused)
         z_tilde, i_tilde, f_tilde, o_tilde = all_tilde.chunk(4, dim=-1)
 
         if b_dev is not None:
-            b_t = b_dev[:, t].view(B, 1, 1)
+            # Force forget gate to zero (log_f = -1000) at boundary positions.
             f_tilde = torch.where(b_t, torch.full_like(f_tilde, _BOUNDARY_RESET_LOGF), f_tilde)
 
         z = torch.tanh(z_tilde)
@@ -154,6 +161,10 @@ def _slstm_scan_sequential(
         log_f = F.logsigmoid(f_tilde)
 
         m_new = torch.where(n == 0.0, i_tilde, torch.maximum(log_f + m, i_tilde))
+        if b_dev is not None:
+            # Reset log-space stabilizer directly to i_tilde when starting a new document.
+            m_new = torch.where(b_t, i_tilde, m_new)
+
         # Gate clamping to <= 1.0 (paper compliance)
         i_prime = torch.minimum(torch.exp(i_tilde - m_new), torch.ones_like(i_tilde))
         f_prime = torch.minimum(torch.exp(log_f + m - m_new), torch.ones_like(i_tilde))
@@ -589,7 +600,9 @@ class sLSTM(nn.Module):
         Args:
             input: Input tensor of shape (B, T, D) if batch_first else (T, B, D).
             state: Optional previous state (sLSTMState or tuple of states per layer).
-            boundaries: Optional boolean mask of shape (B, T) indicating document start boundaries.
+            boundaries: Optional boolean mask of shape (B, T) indicating document start boundaries
+                in packed sequences. When True at position (b, t), resets both recurrent cell memory
+                (c, n, m) and recurrent hidden feedback (h) to prevent cross-document gradient leakage.
 
         Returns:
             Tuple of (output tensor, final state).

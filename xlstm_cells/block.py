@@ -296,7 +296,9 @@ class mLSTMBlock(nn.Module):
         Args:
             x: Input tensor of shape (B, T, d_model).
             state: Optional previous mLSTMState. If None, initialized to zeros.
-            boundaries: Optional boolean mask of shape (B, T) indicating document start boundaries.
+            boundaries: Optional boolean mask of shape (B, T) indicating document start boundaries
+                in packed sequences. When True at position (b, t), resets the recurrent matrix
+                memory (C, n, m) to prevent cross-document attention and gradient leakage.
 
         Returns:
             Tuple of (output_tensor, new_state).
@@ -626,7 +628,9 @@ class sLSTMBlock(nn.Module):
         Args:
             x: Input tensor of shape (B, T, d_model).
             state: Optional previous sLSTMState. If None, initialized to zeros.
-            boundaries: Optional boolean mask of shape (B, T) indicating document start boundaries.
+            boundaries: Optional boolean mask of shape (B, T) indicating document start boundaries
+                in packed sequences. When True at position (b, t), resets both recurrent cell memory
+                (c, n, m) and recurrent hidden feedback (h) to prevent cross-document gradient leakage.
 
         Returns:
             Tuple of (output_tensor, new_state).

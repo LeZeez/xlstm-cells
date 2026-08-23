@@ -687,7 +687,9 @@ class mLSTM(nn.Module):
         Args:
             input: Input tensor of shape (B, T, D) if batch_first else (T, B, D).
             state: Optional previous state (mLSTMState or tuple of states per layer).
-            boundaries: Optional boolean mask of shape (B, T) indicating document start boundaries.
+            boundaries: Optional boolean mask of shape (B, T) indicating document start boundaries
+                in packed sequences. When True at position (b, t), resets the recurrent matrix
+                memory (C, n, m) to prevent cross-document attention and gradient leakage.
 
         Returns:
             Tuple of (output tensor, final state).
