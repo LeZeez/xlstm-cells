@@ -144,10 +144,12 @@ def _slstm_scan_sequential(
     for t in range(T):
         if b_dev is not None:
             b_t = b_dev[:, t].view(B, 1, 1)
-            # Mask out incoming hidden state at document boundary tokens before
-            # the recurrent projection (R_fused @ h) to prevent cross-document
-            # activation and gradient leakage into new document candidate gates.
+            # Mask out incoming hidden state, cell state, and normalizer at document boundary
+            # tokens before the recurrent projection (R_fused @ h) to prevent cross-document
+            # activation and gradient leakage into new document candidate gates and states.
             h = torch.where(b_t, torch.zeros_like(h), h)
+            c = torch.where(b_t, torch.zeros_like(c), c)
+            n = torch.where(b_t, torch.zeros_like(n), n)
 
         all_tilde = all_in[:, t] + torch.einsum("bhd,hde->bhe", h, R_fused)
         z_tilde, i_tilde, f_tilde, o_tilde = all_tilde.chunk(4, dim=-1)

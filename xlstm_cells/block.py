@@ -100,6 +100,8 @@ class mLSTMBlock(nn.Module):
     ):
         """Initializes paper-compliant mLSTMBlock."""
         super().__init__()
+        if not isinstance(d_model, int) or isinstance(d_model, bool) or d_model <= 0:
+            raise ValueError(f"mLSTMBlock: d_model must be a positive integer, got {d_model}")
         if expand_factor is not None and hidden_size is not None:
             raise ValueError(
                 "mLSTMBlock: conflicting arguments: cannot specify both 'expand_factor' and 'hidden_size'. "
