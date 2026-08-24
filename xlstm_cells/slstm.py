@@ -34,7 +34,7 @@ from ._utils import (
     normalize_and_validate_num_heads,
 )
 from .components.init import bias_linspace_init_, small_init_init_
-from .mlstm import _MAX_FORGET_BIAS
+from .configs import sLSTMCellConfig, sLSTMConfig
 
 _EPS = 1e-6
 _BOUNDARY_RESET_LOGF = -1000.0
@@ -205,28 +205,38 @@ class sLSTMCell(nn.Module):
         hidden_size: Hidden feature dimension (must be divisible by num_heads).
         num_heads: Number of scalar memory heads. Default: 4.
         bias: Whether to include learnable input and gate biases. Default: True.
+        config: Optional sLSTMCellConfig object (overrides other args if given).
     """
 
-    def __init__(self, input_size: int, hidden_size: int, num_heads: int = 4,
-                 bias: bool = True):
+    def __init__(
+        self,
+        input_size: Optional[int] = None,
+        hidden_size: Optional[int] = None,
+        num_heads: int = 4,
+        bias: bool = True,
+        config: Optional[sLSTMCellConfig] = None,
+    ):
         """Initializes single-step sLSTMCell."""
         super().__init__()
-        if not isinstance(input_size, int) or isinstance(input_size, bool) or input_size <= 0:
-            raise ValueError(f"sLSTMCell: input_size must be a positive integer, got {input_size}")
-        if not isinstance(hidden_size, int) or isinstance(hidden_size, bool) or hidden_size <= 0:
-            raise ValueError(f"sLSTMCell: hidden_size must be a positive integer, got {hidden_size}")
-        if not isinstance(num_heads, int) or isinstance(num_heads, bool) or num_heads <= 0:
-            raise ValueError(f"sLSTMCell: num_heads must be a positive integer, got {num_heads}")
-        if hidden_size % num_heads != 0:
-            raise ValueError(f"sLSTMCell: hidden_size ({hidden_size}) must be divisible by num_heads ({num_heads})")
-        self.input_size = input_size
-        self.hidden_size = hidden_size
-        self.num_heads = num_heads
-        self.head_dim = hidden_size // num_heads
+        if config is not None:
+            self.config = config
+        else:
+            if input_size is None or hidden_size is None:
+                raise ValueError("sLSTMCell: input_size and hidden_size must be specified if config is None")
+            self.config = sLSTMCellConfig(
+                input_size=input_size,
+                hidden_size=hidden_size,
+                num_heads=num_heads,
+                bias=bias,
+            )
+        self.input_size = self.config.input_size
+        self.hidden_size = self.config.hidden_size
+        self.num_heads = self.config.num_heads
+        self.head_dim = self.hidden_size // self.num_heads
         Dh = self.head_dim
 
-        self.W_all = nn.Linear(input_size, 4 * hidden_size, bias=bias)
-        self.R_fused = nn.Parameter(torch.empty(num_heads, Dh, 4 * Dh))
+        self.W_all = nn.Linear(self.input_size, 4 * self.hidden_size, bias=self.config.bias)
+        self.R_fused = nn.Parameter(torch.empty(self.num_heads, Dh, 4 * Dh))
 
         self.reset_parameters()
 
@@ -290,13 +300,6 @@ class sLSTMCell(nn.Module):
 
         return h_new.reshape(B, self.hidden_size), sLSTMState(c_new, n_new, m_new, h_new)
 
-    @torch.no_grad()
-    def clamp_forget_bias(self, max_val: float = _MAX_FORGET_BIAS) -> None:
-        """Clamps forget gate bias to prevent numerical saturation."""
-        HS = self.hidden_size
-        if self.W_all.bias is not None:
-            self.W_all.bias.data[2*HS:3*HS].clamp_(-max_val, max_val)
-
 
 # ---------------------------------------------------------------------------
 # sLSTM -- Full Sequence Layer
@@ -326,8 +329,8 @@ class sLSTM(nn.Module):
 
     def __init__(
         self,
-        input_size: int,
-        hidden_size: int,
+        input_size: Optional[int] = None,
+        hidden_size: Optional[int] = None,
         num_layers: int = 1,
         num_heads: Union[int, List[int], Tuple[int, ...]] = 4,
         bias: bool = True,
@@ -339,58 +342,84 @@ class sLSTM(nn.Module):
         use_checkpoint: bool = False,
         fast_mode: bool = False,
         fast_chunk_size: int = 32,
+        config: Optional[sLSTMConfig] = None,
     ):
         """Initializes multi-layer sLSTM sequence model."""
         super().__init__()
-        heads_list = normalize_and_validate_num_heads(num_heads, num_layers, hidden_size, "sLSTM")
-
-        # Hard-block invalid backend/mode overlaps
-        if backend == "cuda" and fast_mode:
-            raise ValueError(
-                "sLSTM: conflicting arguments: backend='cuda' cannot be combined with fast_mode=True. "
-                "fast_mode is for torch.compile chunking under backend='vanilla'. Set fast_mode=False "
-                "when using backend='cuda'."
+        if config is not None:
+            self.config = config
+        else:
+            if input_size is None or hidden_size is None:
+                raise ValueError("sLSTM: input_size and hidden_size must be specified if config is None")
+            self.config = sLSTMConfig(
+                input_size=input_size,
+                hidden_size=hidden_size,
+                num_layers=num_layers,
+                num_heads=num_heads,
+                bias=bias,
+                batch_first=batch_first,
+                dropout=dropout,
+                bidirectional=bidirectional,
+                pack_state=pack_state,
+                backend=backend,
+                use_checkpoint=use_checkpoint,
+                fast_mode=fast_mode,
+                fast_chunk_size=fast_chunk_size,
             )
-        if backend not in ("vanilla", "cuda"):
-            raise ValueError(f"sLSTM: unknown backend '{backend}'. Must be 'vanilla' or 'cuda'.")
-        if fast_mode:
-            if not isinstance(fast_chunk_size, int) or isinstance(fast_chunk_size, bool) or fast_chunk_size <= 0:
+
+        heads_list = normalize_and_validate_num_heads(
+            self.config.num_heads, self.config.num_layers, self.config.hidden_size, "sLSTM"
+        )
+
+        # Handle backend / mode settings
+        fast_mode_val = self.config.fast_mode
+        if self.config.backend == "cuda" and fast_mode_val:
+            warnings.warn(
+                "sLSTM: backend='cuda' does not use fast_mode (fast_mode is for torch.compile chunking under backend='vanilla'). "
+                "fast_mode will be ignored.",
+                stacklevel=2,
+            )
+            fast_mode_val = False
+        if self.config.backend not in ("vanilla", "cuda"):
+            raise ValueError(f"sLSTM: unknown backend '{self.config.backend}'. Must be 'vanilla' or 'cuda'.")
+        if fast_mode_val:
+            if not isinstance(self.config.fast_chunk_size, int) or isinstance(self.config.fast_chunk_size, bool) or self.config.fast_chunk_size <= 0:
                 raise ValueError(
-                    f"sLSTM: fast_chunk_size must be a strictly positive integer when fast_mode=True, got {fast_chunk_size}."
+                    f"sLSTM: fast_chunk_size must be a strictly positive integer when fast_mode=True, got {self.config.fast_chunk_size}."
                 )
 
-        self.input_size = input_size
-        self.hidden_size = hidden_size
-        self.num_layers = num_layers
+        self.input_size = self.config.input_size
+        self.hidden_size = self.config.hidden_size
+        self.num_layers = self.config.num_layers
         self.num_heads = heads_list
-        self.bias = bias
-        self.batch_first = batch_first
-        self.dropout = dropout
-        self.bidirectional = bidirectional
-        self.num_directions = 2 if bidirectional else 1
-        self.pack_state = pack_state
-        self.backend = backend
-        self.use_checkpoint = use_checkpoint
-        self.fast_mode = fast_mode
-        self.fast_chunk_size = fast_chunk_size
+        self.bias = self.config.bias
+        self.batch_first = self.config.batch_first
+        self.dropout = self.config.dropout
+        self.bidirectional = self.config.bidirectional
+        self.num_directions = 2 if self.bidirectional else 1
+        self.pack_state = self.config.pack_state
+        self.backend = self.config.backend
+        self.use_checkpoint = self.config.use_checkpoint
+        self.fast_mode = fast_mode_val
+        self.fast_chunk_size = self.config.fast_chunk_size
 
         self._cuda_kernel = None
         self._cuda_funcs = {}
-        if backend == "cuda":
+        if self.backend == "cuda":
             self._init_cuda_backend()
 
-        for layer_idx in range(num_layers):
+        for layer_idx in range(self.num_layers):
             Hh = self.num_heads[layer_idx]
-            Dh = hidden_size // Hh
+            Dh = self.hidden_size // Hh
             for d in range(self.num_directions):
-                in_sz = input_size if layer_idx == 0 else hidden_size * self.num_directions
-                w_all = nn.Linear(in_sz, 4 * hidden_size, bias=bias)
+                in_sz = self.input_size if layer_idx == 0 else self.hidden_size * self.num_directions
+                w_all = nn.Linear(in_sz, 4 * self.hidden_size, bias=self.bias)
                 r_fused = nn.Parameter(torch.empty(Hh, Dh, 4 * Dh))
                 setattr(self, f"W_all_{d}_{layer_idx}", w_all)
                 setattr(self, f"R_fused_{d}_{layer_idx}", r_fused)
 
-        if dropout > 0.0 and num_layers > 1:
-            self.drop = nn.Dropout(dropout)
+        if self.dropout > 0.0 and self.num_layers > 1:
+            self.drop = nn.Dropout(self.dropout)
         else:
             self.drop = None
 
@@ -735,13 +764,3 @@ class sLSTM(nn.Module):
             f"backend={self.backend!r}, use_checkpoint={self.use_checkpoint}, "
             f"fast_mode={self.fast_mode}, fast_chunk_size={self.fast_chunk_size}"
         )
-
-    @torch.no_grad()
-    def clamp_forget_bias(self, max_val: float = _MAX_FORGET_BIAS) -> None:
-        """Clamps forget gate bias across all layers and directions."""
-        HS = self.hidden_size
-        for layer_idx in range(self.num_layers):
-            for d in range(self.num_directions):
-                w_all = getattr(self, f"W_all_{d}_{layer_idx}")
-                if w_all.bias is not None:
-                    w_all.bias.data[2*HS:3*HS].clamp_(-max_val, max_val)

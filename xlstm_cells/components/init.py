@@ -2,6 +2,8 @@
 # Maximilian Beck
 """Weight initialization routines for xLSTM blocks and projections."""
 
+from __future__ import annotations
+
 import math
 import torch
 

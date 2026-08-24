@@ -2,7 +2,7 @@
 mLSTM: Matrix-memory LSTM cell and layer.
 
 100% aligned with the official xLSTM paper (arXiv:2405.04517v2, Figure 11) and NX-AI/xlstm:
-1. Gating from concatenated [q, k, v] vectors (dimension 3 * inner_dim -> 2 * num_heads).
+1. Gating from concatenated [q, k, v] vectors (dimension 2*qk_dim + v_dim -> 2 * num_heads).
 2. Linspace forget-gate bias init (3.4 to 6.0 across heads) for diverse memory timescales.
 3. Input-gate bias init ~ N(0.0, 0.1).
 4. Matrix memory covariance update with exp-stabilizer m and configurable denominator floor eps (default 1e-6).
@@ -10,6 +10,7 @@ mLSTM: Matrix-memory LSTM cell and layer.
 6. Native chunked-parallel scan fallback for CPU, non-divisible sequence lengths, or compilation.
 7. Packed document boundaries reset (f_tilde = -1000.0).
 8. Non-reentrant activation checkpointing support.
+9. Support for asymmetric key-query and value dimensions (qk_dim_factor, v_dim_factor).
 """
 
 from __future__ import annotations
@@ -31,6 +32,7 @@ from ._utils import (
 )
 from .components.init import bias_linspace_init_, small_init_init_, wang_init_
 from .components.ln import MultiHeadLayerNorm
+from .configs import mLSTMCellConfig, mLSTMConfig
 
 try:
     from mlstm_kernels.torch.backend_module import (
@@ -44,7 +46,6 @@ except ImportError:
 _EPS = 1e-6
 _MLSTM_CHUNK_SIZE = 128
 _BOUNDARY_RESET_LOGF = -1000.0
-_MAX_FORGET_BIAS = 4.0
 
 _TRITON_CHUNKWISE_KERNELS = {
     "limit_chunk": "chunkwise--triton_limit_chunk",
@@ -63,9 +64,9 @@ class mLSTMState:
     """State for mLSTM, held as named tensors for full user control.
 
     Shapes (single direction, single layer):
-        C  (B, H, Dh, Dh)   matrix memory per head
-        n  (B, H, Dh)       key normalizer per head
-        m  (B, H)           log-space stabilizer per head
+        C  (B, H, Dh_qk, Dh_v)  matrix memory per head
+        n  (B, H, Dh_qk)        key normalizer per head
+        m  (B, H)               log-space stabilizer per head
     """
 
     C: torch.Tensor
@@ -74,12 +75,15 @@ class mLSTMState:
 
     @classmethod
     def init(cls, batch_size: int, num_heads: int, head_dim: int,
+             v_head_dim: Optional[int] = None,
              device=None, dtype=None) -> "mLSTMState":
         """Initializes zero state tensors for mLSTM."""
-        H, Dh = num_heads, head_dim
+        H = num_heads
+        Dh_qk = head_dim
+        Dh_v = v_head_dim if v_head_dim is not None else head_dim
         return cls(
-            C=torch.zeros(batch_size, H, Dh, Dh, device=device, dtype=dtype),
-            n=torch.zeros(batch_size, H, Dh, device=device, dtype=dtype),
+            C=torch.zeros(batch_size, H, Dh_qk, Dh_v, device=device, dtype=dtype),
+            n=torch.zeros(batch_size, H, Dh_qk, device=device, dtype=dtype),
             m=torch.zeros(batch_size, H, device=device, dtype=dtype),
         )
 
@@ -112,8 +116,9 @@ def _mlstm_recurrent_scan(
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Recurrent scan for step-by-step sequential processing.
     Accepts (q, k, v, [o], i_tilde, log_f, C, n, m, [eps]).
+    Supports both symmetric (Dh x Dh) and asymmetric (Dh_qk x Dh_v) dimensions.
     """
-    if len(args) >= 9 and args[3].dim() == 4:
+    if len(args) >= 9:
         q, k, v, o, i_tilde, log_f, C, n, m = args[:9]
         eps = args[9] if len(args) > 9 else kwargs.get("eps", _EPS)
     else:
@@ -121,8 +126,9 @@ def _mlstm_recurrent_scan(
         o = None
         eps = args[8] if len(args) > 8 else kwargs.get("eps", _EPS)
 
-    B, T, H, Dh = q.shape
-    hidden_size = H * Dh
+    B, T, H, Dh_qk = q.shape
+    Dh_v = v.shape[-1]
+    hidden_size = H * Dh_v
     output_list: List[torch.Tensor] = []
 
     for t in range(T):
@@ -137,12 +143,12 @@ def _mlstm_recurrent_scan(
         i_prime = torch.exp(it_raw - m)
         f_prime = torch.exp(log_ft + m_prev - m)
 
-        vk = vt.unsqueeze(-1) * kt.unsqueeze(-2)
-        C = f_prime[..., None, None] * C + i_prime[..., None, None] * vk
+        kv = kt.unsqueeze(-1) * vt.unsqueeze(-2)
+        C = f_prime[..., None, None] * C + i_prime[..., None, None] * kv
         n = f_prime[..., None] * n + i_prime[..., None] * kt
 
-        h_tilde = torch.einsum("bhde,bhe->bhd", C, qt)
-        qn = torch.einsum("bhd,bhd->bh", n, qt).abs()
+        h_tilde = torch.einsum("bhe,bhev->bhv", qt, C)
+        qn = torch.einsum("bhe,bhe->bh", n, qt).abs()
         denom = torch.maximum(qn, torch.exp(-m)) + eps
         h = h_tilde / denom[..., None]
         if o is not None:
@@ -159,8 +165,9 @@ def _mlstm_recurrent_scan_parallel(
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Parallel mLSTM recurrence via numerically stable linear attention.
     Accepts (q, k, v, [o], i_tilde, log_f, C_init, n_init, m_init, [eps]).
+    Supports both symmetric and asymmetric (Dh_qk x Dh_v) dimensions.
     """
-    if len(args) >= 9 and args[3].dim() == 4:
+    if len(args) >= 9:
         q, k, v, o, i_tilde, log_f, C_init, n_init, m_init = args[:9]
         eps = args[9] if len(args) > 9 else kwargs.get("eps", _EPS)
     else:
@@ -168,8 +175,9 @@ def _mlstm_recurrent_scan_parallel(
         o = None
         eps = args[8] if len(args) > 8 else kwargs.get("eps", _EPS)
 
-    B, T, H, Dh = q.shape
-    hidden_size = H * Dh
+    B, T, H, Dh_qk = q.shape
+    Dh_v = v.shape[-1]
+    hidden_size = H * Dh_v
 
     log_f_perm = log_f.permute(0, 2, 1)
     f_cum = torch.cumsum(log_f_perm, dim=-1)
@@ -192,8 +200,8 @@ def _mlstm_recurrent_scan_parallel(
     D_intra = torch.exp(d_stable).masked_fill(~causal_mask, 0.0)
 
     f_carry = torch.exp(m_inter - m_attn)
-    C_inter_val = torch.einsum("bht,bhde->bhtde", f_carry, C_init)
-    n_inter_val = torch.einsum("bht,bhd->bhtd", f_carry, n_init)
+    C_inter_val = torch.einsum("bht,bhev->bhtev", f_carry, C_init)
+    n_inter_val = torch.einsum("bht,bhe->bhte", f_carry, n_init)
 
     q_p = q.permute(0, 2, 1, 3)
     k_p = k.permute(0, 2, 1, 3)
@@ -201,13 +209,13 @@ def _mlstm_recurrent_scan_parallel(
 
     S = torch.einsum("bhid,bhjd->bhij", q_p, k_p)
     A = S * D_intra
-    H_intra = torch.einsum("bhij,bhjd->bhid", A, v_p)
+    H_intra = torch.einsum("bhij,bhjv->bhiv", A, v_p)
 
-    h_inter = torch.einsum("bhtde,bhte->bhtd", C_inter_val, q_p)
+    h_inter = torch.einsum("bhtev,bhte->bhtv", C_inter_val, q_p)
     numerator = H_intra + h_inter
 
     denom_intra = A.sum(dim=-1)
-    denom_inter = torch.einsum("bhtd,bhtd->bht", n_inter_val, q_p)
+    denom_inter = torch.einsum("bhte,bhte->bht", n_inter_val, q_p)
     denom_raw = (denom_intra + denom_inter).permute(0, 2, 1)
 
     denom = torch.maximum(denom_raw.abs(), torch.exp(-m_attn.permute(0, 2, 1))) + eps
@@ -219,11 +227,11 @@ def _mlstm_recurrent_scan_parallel(
     m_final = m_attn[..., -1].detach()
     f_decay_total = torch.exp(f_cum[..., -1] + m_init - m_final)
     i_decay_total = torch.exp(d_raw[..., -1, :] - m_final[..., None])
-    v_weighted = torch.einsum("bht,bhtd->bhtd", i_decay_total, v_p)
+    k_weighted = torch.einsum("bht,bhte->bhte", i_decay_total, k_p)
     C_final = (f_decay_total[..., None, None] * C_init +
-               torch.einsum("bhtd,bhte->bhde", v_weighted, k_p))
+               torch.einsum("bhte,bhtv->bhev", k_weighted, v_p))
     n_final = (f_decay_total[..., None] * n_init +
-               torch.einsum("bht,bhtd->bhd", i_decay_total, k_p))
+               torch.einsum("bht,bhte->bhe", i_decay_total, k_p))
 
     return outputs, C_final, n_final, m_final
 
@@ -233,7 +241,7 @@ def _mlstm_recurrent_scan_parallel_chunked(
     **kwargs,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Chunked parallel mLSTM scan: O(T * chunk_size) memory."""
-    if len(args) >= 9 and args[3].dim() == 4:
+    if len(args) >= 9:
         q, k, v, o, i_tilde, log_f, C_init, n_init, m_init = args[:9]
         chunk_size = kwargs.get("chunk_size", _MLSTM_CHUNK_SIZE)
         eps = args[9] if len(args) > 9 else kwargs.get("eps", _EPS)
@@ -283,35 +291,70 @@ class mLSTMCell(nn.Module):
         num_heads: Number of matrix-memory heads. Default: 4.
         bias: Whether projection layers include bias. Default: False.
         eps: Denominator stabilizer epsilon. Default: 1e-6.
+        qk_dim_factor: Optional factor for key/query dimensions (asymmetric memory).
+        v_dim_factor: Optional factor for value dimension (asymmetric memory).
+        config: Optional mLSTMCellConfig object (overrides other args if provided).
     """
 
-    def __init__(self, input_size: int, hidden_size: int, num_heads: int = 4,
-                 bias: bool = False, eps: float = _EPS):
+    def __init__(
+        self,
+        input_size: Optional[int] = None,
+        hidden_size: Optional[int] = None,
+        num_heads: int = 4,
+        bias: bool = False,
+        eps: float = _EPS,
+        qk_dim_factor: Optional[float] = None,
+        v_dim_factor: Optional[float] = None,
+        config: Optional[mLSTMCellConfig] = None,
+    ):
         """Initializes single-step mLSTMCell."""
         super().__init__()
-        if not isinstance(input_size, int) or isinstance(input_size, bool) or input_size <= 0:
-            raise ValueError(f"mLSTMCell: input_size must be a positive integer, got {input_size}")
-        if not isinstance(hidden_size, int) or isinstance(hidden_size, bool) or hidden_size <= 0:
-            raise ValueError(f"mLSTMCell: hidden_size must be a positive integer, got {hidden_size}")
-        if not isinstance(num_heads, int) or isinstance(num_heads, bool) or num_heads <= 0:
-            raise ValueError(f"mLSTMCell: num_heads must be a positive integer, got {num_heads}")
-        if hidden_size % num_heads != 0:
-            raise ValueError(f"mLSTMCell: hidden_size ({hidden_size}) must be divisible by num_heads ({num_heads})")
-        if not isinstance(eps, (int, float)) or isinstance(eps, bool) or not math.isfinite(eps) or eps <= 0:
-            raise ValueError("eps must be a positive finite float")
-        self.input_size = input_size
-        self.hidden_size = hidden_size
-        self.num_heads = num_heads
-        self.head_dim = hidden_size // num_heads
-        self.eps = float(eps)
+        if config is not None:
+            self.config = config
+        else:
+            if input_size is None or hidden_size is None:
+                raise ValueError("mLSTMCell: input_size and hidden_size must be specified if config is None")
+            self.config = mLSTMCellConfig(
+                input_size=input_size,
+                hidden_size=hidden_size,
+                num_heads=num_heads,
+                bias=bias,
+                eps=eps,
+                qk_dim_factor=qk_dim_factor,
+                v_dim_factor=v_dim_factor,
+            )
 
-        self.q_proj = nn.Linear(input_size, hidden_size, bias=bias)
-        self.k_proj = nn.Linear(input_size, hidden_size, bias=bias)
-        self.v_proj = nn.Linear(input_size, hidden_size, bias=bias)
+        self.input_size = self.config.input_size
+        self.hidden_size = self.config.hidden_size
+        self.num_heads = self.config.num_heads
+        self.eps = float(self.config.eps)
+
+        if self.config.qk_dim_factor is not None:
+            self.qk_dim = round(self.config.qk_dim_factor * self.hidden_size)
+        else:
+            self.qk_dim = self.hidden_size
+
+        if self.config.v_dim_factor is not None:
+            self.v_dim = round(self.config.v_dim_factor * self.hidden_size)
+        else:
+            self.v_dim = self.hidden_size
+
+        if self.qk_dim % self.num_heads != 0:
+            raise ValueError(f"mLSTMCell: qk_dim ({self.qk_dim}) must be divisible by num_heads ({self.num_heads})")
+        if self.v_dim % self.num_heads != 0:
+            raise ValueError(f"mLSTMCell: v_dim ({self.v_dim}) must be divisible by num_heads ({self.num_heads})")
+
+        self.head_dim = self.qk_dim // self.num_heads
+        self.v_head_dim = self.v_dim // self.num_heads
+
+        self.q_proj = nn.Linear(self.input_size, self.qk_dim, bias=self.config.bias)
+        self.k_proj = nn.Linear(self.input_size, self.qk_dim, bias=self.config.bias)
+        self.v_proj = nn.Linear(self.input_size, self.v_dim, bias=self.config.bias)
 
         # Gates from [q, k, v]
-        self.igate = nn.Linear(3 * hidden_size, num_heads, bias=True)
-        self.fgate = nn.Linear(3 * hidden_size, num_heads, bias=True)
+        gate_in_dim = 2 * self.qk_dim + self.v_dim
+        self.igate = nn.Linear(gate_in_dim, self.num_heads, bias=True)
+        self.fgate = nn.Linear(gate_in_dim, self.num_heads, bias=True)
 
         self._sf = math.sqrt(self.head_dim)
         self.reset_parameters()
@@ -332,7 +375,7 @@ class mLSTMCell(nn.Module):
 
     def init_state(self, batch_size: int, device=None, dtype=None) -> mLSTMState:
         """Initializes zero state for one step of mLSTM."""
-        return mLSTMState.init(batch_size, self.num_heads, self.head_dim, device, dtype)
+        return mLSTMState.init(batch_size, self.num_heads, self.head_dim, self.v_head_dim, device, dtype)
 
     def forward(
         self,
@@ -344,13 +387,13 @@ class mLSTMCell(nn.Module):
         """Runs a single recurrent time-step of mLSTM.
 
         Args:
-            x_or_q: Input token tensor (B, input_size) or precomputed q (B, hidden_size).
-            state_or_k: Previous mLSTMState, or precomputed k (B, hidden_size).
-            v: Optional precomputed v (B, hidden_size).
+            x_or_q: Input token tensor (B, input_size) or precomputed q (B, qk_dim).
+            state_or_k: Previous mLSTMState, or precomputed k (B, qk_dim).
+            v: Optional precomputed v (B, v_dim).
             state: Previous mLSTMState when precomputed (q, k, v) are provided.
 
         Returns:
-            Tuple of (output token tensor (B, hidden_size), new_state).
+            Tuple of (output token tensor (B, v_dim), new_state).
         """
         if v is None and isinstance(state_or_k, mLSTMState):
             x_t = x_or_q
@@ -365,7 +408,7 @@ class mLSTMCell(nn.Module):
             st = state
 
         B = q.size(0)
-        H, Dh = self.num_heads, self.head_dim
+        H, Dh_qk, Dh_v = self.num_heads, self.head_dim, self.v_head_dim
 
         # Gating from [q, k, v]
         if_input = torch.cat([q, k, v_vec], dim=-1)
@@ -373,31 +416,25 @@ class mLSTMCell(nn.Module):
         f_tilde = self.fgate(if_input)
         log_f = F.logsigmoid(f_tilde)
 
-        q_view = q.view(B, H, Dh)
-        k_view = (k / self._sf).view(B, H, Dh)
-        v_view = v_vec.view(B, H, Dh)
+        q_view = q.view(B, H, Dh_qk)
+        k_view = (k / self._sf).view(B, H, Dh_qk)
+        v_view = v_vec.view(B, H, Dh_v)
 
         m_prev = st.m
         m = torch.maximum(log_f + m_prev, i_tilde)
         i_prime = torch.exp(i_tilde - m)
         f_prime = torch.exp(log_f + m_prev - m)
 
-        vk = v_view.unsqueeze(-1) * k_view.unsqueeze(-2)
-        C = f_prime[..., None, None] * st.C + i_prime[..., None, None] * vk
+        kv = k_view.unsqueeze(-1) * v_view.unsqueeze(-2)
+        C = f_prime[..., None, None] * st.C + i_prime[..., None, None] * kv
         n = f_prime[..., None] * st.n + i_prime[..., None] * k_view
 
-        h_tilde = torch.einsum("bhde,bhe->bhd", C, q_view)
-        qn = torch.einsum("bhd,bhd->bh", n, q_view).abs()
+        h_tilde = torch.einsum("bhe,bhev->bhv", q_view, C)
+        qn = torch.einsum("bhe,bhe->bh", n, q_view).abs()
         denom = torch.maximum(qn, torch.exp(-m)) + self.eps
         h = h_tilde / denom[..., None]
 
-        return h.reshape(B, self.hidden_size), mLSTMState(C, n, m)
-
-    @torch.no_grad()
-    def clamp_forget_bias(self, max_val: float = _MAX_FORGET_BIAS) -> None:
-        """Clamps forget gate bias to prevent numerical saturation."""
-        if self.fgate.bias is not None:
-            self.fgate.bias.data.clamp_(-max_val, max_val)
+        return h.reshape(B, self.v_dim), mLSTMState(C, n, m)
 
 
 # ---------------------------------------------------------------------------
@@ -426,12 +463,15 @@ class mLSTM(nn.Module):
         chunkwise_kernel: Name of Triton chunkwise kernel ("limit_chunk" or "xl_chunk"). Default: "xl_chunk".
         chunk_size: Chunk size for chunked parallel scan. Default: 128.
         eps: Denominator stabilizer epsilon. Default: 1e-6.
+        qk_dim_factor: Optional asymmetric QK projection factor.
+        v_dim_factor: Optional asymmetric V projection factor.
+        config: Optional mLSTMConfig object (overrides other kwargs if given).
     """
 
     def __init__(
         self,
-        input_size: int,
-        hidden_size: int,
+        input_size: Optional[int] = None,
+        hidden_size: Optional[int] = None,
         num_layers: int = 1,
         num_heads: Union[int, List[int], Tuple[int, ...]] = 4,
         bias: bool = False,
@@ -444,49 +484,94 @@ class mLSTM(nn.Module):
         chunkwise_kernel: str = "xl_chunk",
         chunk_size: int = _MLSTM_CHUNK_SIZE,
         eps: Optional[float] = None,
+        qk_dim_factor: Optional[float] = None,
+        v_dim_factor: Optional[float] = None,
+        config: Optional[mLSTMConfig] = None,
     ):
         """Initializes multi-layer mLSTM sequence model."""
         super().__init__()
-        heads_list = normalize_and_validate_num_heads(num_heads, num_layers, hidden_size, "mLSTM")
-        if chunkwise_kernel not in _TRITON_CHUNKWISE_KERNELS:
+        if config is not None:
+            self.config = config
+        else:
+            if input_size is None or hidden_size is None:
+                raise ValueError("mLSTM: input_size and hidden_size must be specified if config is None")
+            self.config = mLSTMConfig(
+                input_size=input_size,
+                hidden_size=hidden_size,
+                num_layers=num_layers,
+                num_heads=num_heads,
+                bias=bias,
+                batch_first=batch_first,
+                dropout=dropout,
+                bidirectional=bidirectional,
+                pack_state=pack_state,
+                use_checkpoint=use_checkpoint,
+                use_triton_kernels=use_triton_kernels,
+                chunkwise_kernel=chunkwise_kernel,
+                chunk_size=chunk_size,
+                eps=eps,
+                qk_dim_factor=qk_dim_factor,
+                v_dim_factor=v_dim_factor,
+            )
+
+        heads_list = normalize_and_validate_num_heads(
+            self.config.num_heads, self.config.num_layers, self.config.hidden_size, "mLSTM"
+        )
+        if self.config.chunkwise_kernel not in _TRITON_CHUNKWISE_KERNELS:
             raise ValueError(
-                f"mLSTM: unknown chunkwise_kernel {chunkwise_kernel!r}, "
+                f"mLSTM: unknown chunkwise_kernel {self.config.chunkwise_kernel!r}, "
                 f"expected one of {list(_TRITON_CHUNKWISE_KERNELS.keys())}"
             )
 
-        if not isinstance(chunk_size, int) or isinstance(chunk_size, bool) or chunk_size <= 0:
-            raise ValueError(f"chunk_size must be a strictly positive integer, got {chunk_size}")
+        if not isinstance(self.config.chunk_size, int) or isinstance(self.config.chunk_size, bool) or self.config.chunk_size <= 0:
+            raise ValueError(f"chunk_size must be a strictly positive integer, got {self.config.chunk_size}")
 
-        self.input_size = input_size
-        self.hidden_size = hidden_size
-        self.num_layers = num_layers
+        self.input_size = self.config.input_size
+        self.hidden_size = self.config.hidden_size
+        self.num_layers = self.config.num_layers
         self.num_heads = heads_list
-        self.bias = bias
-        self.batch_first = batch_first
-        self.dropout = dropout
-        self.bidirectional = bidirectional
-        self.num_directions = 2 if bidirectional else 1
-        self.pack_state = pack_state
-        self.use_checkpoint = use_checkpoint
-        self._use_triton_kernels = use_triton_kernels and _HAS_MLSTM_KERNELS
-        self._chunkwise_kernel = chunkwise_kernel
-        self._chunk_size = chunk_size
+        self.bias = self.config.bias
+        self.batch_first = self.config.batch_first
+        self.dropout = self.config.dropout
+        self.bidirectional = self.config.bidirectional
+        self.num_directions = 2 if self.bidirectional else 1
+        self.pack_state = self.config.pack_state
+        self.use_checkpoint = self.config.use_checkpoint
+        self._use_triton_kernels = self.config.use_triton_kernels and _HAS_MLSTM_KERNELS
+        self._chunkwise_kernel = self.config.chunkwise_kernel
+        self._chunk_size = self.config.chunk_size
         self._mlstm_backend = None
 
-        if eps is None:
-            eps = _EPS
-        if not isinstance(eps, (int, float)) or isinstance(eps, bool) or not math.isfinite(eps) or eps <= 0:
+        eps_val = self.config.eps if self.config.eps is not None else _EPS
+        if not isinstance(eps_val, (int, float)) or isinstance(eps_val, bool) or not math.isfinite(eps_val) or eps_val <= 0:
             raise ValueError("eps must be a positive finite float")
-        self._eps = float(eps)
+        self._eps = float(eps_val)
 
-        for layer_idx in range(num_layers):
+        self.qk_dim_factor = self.config.qk_dim_factor
+        self.v_dim_factor = self.config.v_dim_factor
+        self.qk_dim = round(self.qk_dim_factor * self.hidden_size) if self.qk_dim_factor is not None else self.hidden_size
+        self.v_dim = round(self.v_dim_factor * self.hidden_size) if self.v_dim_factor is not None else self.hidden_size
+
+        for layer_idx in range(self.num_layers):
+            layer_heads = self.num_heads[layer_idx]
+            if self.qk_dim % layer_heads != 0:
+                raise ValueError(
+                    f"mLSTM: layer {layer_idx} qk_dim ({self.qk_dim}) must be divisible by num_heads ({layer_heads})"
+                )
+            if self.v_dim % layer_heads != 0:
+                raise ValueError(
+                    f"mLSTM: layer {layer_idx} v_dim ({self.v_dim}) must be divisible by num_heads ({layer_heads})"
+                )
+
+        for layer_idx in range(self.num_layers):
             for d in range(self.num_directions):
-                in_sz = input_size if layer_idx == 0 else hidden_size * self.num_directions
-                q_p = nn.Linear(in_sz, hidden_size, bias=bias)
-                k_p = nn.Linear(in_sz, hidden_size, bias=bias)
-                v_p = nn.Linear(in_sz, hidden_size, bias=bias)
-                ig = nn.Linear(3 * hidden_size, self.num_heads[layer_idx], bias=True)
-                fg = nn.Linear(3 * hidden_size, self.num_heads[layer_idx], bias=True)
+                in_sz = self.input_size if layer_idx == 0 else self.v_dim * self.num_directions
+                q_p = nn.Linear(in_sz, self.qk_dim, bias=self.bias)
+                k_p = nn.Linear(in_sz, self.qk_dim, bias=self.bias)
+                v_p = nn.Linear(in_sz, self.v_dim, bias=self.bias)
+                gate_in_dim = 2 * self.qk_dim + self.v_dim
+                ig = nn.Linear(gate_in_dim, self.num_heads[layer_idx], bias=True)
+                fg = nn.Linear(gate_in_dim, self.num_heads[layer_idx], bias=True)
 
                 setattr(self, f"q_proj_{d}_{layer_idx}", q_p)
                 setattr(self, f"k_proj_{d}_{layer_idx}", k_p)
@@ -494,8 +579,8 @@ class mLSTM(nn.Module):
                 setattr(self, f"igate_{d}_{layer_idx}", ig)
                 setattr(self, f"fgate_{d}_{layer_idx}", fg)
 
-        if dropout > 0.0 and num_layers > 1:
-            self.drop = nn.Dropout(dropout)
+        if self.dropout > 0.0 and self.num_layers > 1:
+            self.drop = nn.Dropout(self.dropout)
         else:
             self.drop = None
 
@@ -524,7 +609,7 @@ class mLSTM(nn.Module):
         """Initializes layer parameters."""
         for layer_idx in range(self.num_layers):
             for d in range(self.num_directions):
-                in_sz = self.input_size if layer_idx == 0 else self.hidden_size * self.num_directions
+                in_sz = self.input_size if layer_idx == 0 else self.v_dim * self.num_directions
                 qp = getattr(self, f"q_proj_{d}_{layer_idx}")
                 kp = getattr(self, f"k_proj_{d}_{layer_idx}")
                 vp = getattr(self, f"v_proj_{d}_{layer_idx}")
@@ -548,11 +633,12 @@ class mLSTM(nn.Module):
         states = []
         for layer_idx in range(self.num_layers):
             Hh = self.num_heads[layer_idx]
-            Dh = self.hidden_size // Hh
+            Dh_qk = self.qk_dim // Hh
+            Dh_v = self.v_dim // Hh
             D = self.num_directions
             states.append(mLSTMState(
-                C=torch.zeros(D, batch_size, Hh, Dh, Dh, device=device, dtype=dtype),
-                n=torch.zeros(D, batch_size, Hh, Dh, device=device, dtype=dtype),
+                C=torch.zeros(D, batch_size, Hh, Dh_qk, Dh_v, device=device, dtype=dtype),
+                n=torch.zeros(D, batch_size, Hh, Dh_qk, device=device, dtype=dtype),
                 m=torch.zeros(D, batch_size, Hh, device=device, dtype=dtype),
             ))
         return tuple(states) if self.pack_state else (states[0] if self.num_layers == 1 else tuple(states))
@@ -560,7 +646,8 @@ class mLSTM(nn.Module):
     def _project(self, x: torch.Tensor, d: int, layer_idx: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         B, T, _ = x.shape
         Hh = self.num_heads[layer_idx]
-        Dh = self.hidden_size // Hh
+        Dh_qk = self.qk_dim // Hh
+        Dh_v = self.v_dim // Hh
 
         qp = getattr(self, f"q_proj_{d}_{layer_idx}")
         kp = getattr(self, f"k_proj_{d}_{layer_idx}")
@@ -576,9 +663,9 @@ class mLSTM(nn.Module):
         i_tilde = ig(if_input)
         f_raw = fg(if_input)
 
-        q = q_raw.view(B, T, Hh, Dh)
-        k = (k_raw / math.sqrt(Dh)).view(B, T, Hh, Dh)
-        v = v_raw.view(B, T, Hh, Dh)
+        q = q_raw.view(B, T, Hh, Dh_qk)
+        k = (k_raw / math.sqrt(Dh_qk)).view(B, T, Hh, Dh_qk)
+        v = v_raw.view(B, T, Hh, Dh_v)
 
         return q, k, v, i_tilde, f_raw
 
@@ -616,8 +703,9 @@ class mLSTM(nn.Module):
         boundaries: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         Hh = self.num_heads[layer_idx]
-        Dh = self.hidden_size // Hh
-        sf = math.sqrt(Dh)
+        Dh_qk = self.qk_dim // Hh
+        Dh_v = self.v_dim // Hh
+        sf = math.sqrt(Dh_qk)
         B, T, _ = x.shape
 
         q, k, v, i_tilde, f_raw = self._project(x, d, layer_idx)
@@ -658,13 +746,17 @@ class mLSTM(nn.Module):
         m: torch.Tensor,
         boundaries: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        is_symmetric = (self.qk_dim == self.v_dim)
+        head_dim_supported = ((self.qk_dim // self.num_heads[layer_idx]) >= 16)
         if (self._use_triton_kernels
                 and x.is_cuda
                 and x.size(1) % self._chunk_size == 0
+                and is_symmetric
+                and head_dim_supported
                 and not torch._dynamo.is_compiling()):
             return self._run_layer_kernels(x, d, layer_idx, C, n, m, boundaries)
 
-        if self._use_triton_kernels:
+        if self._use_triton_kernels and is_symmetric and head_dim_supported:
             global _triton_fallback_warned
             if not _triton_fallback_warned:
                 if not x.is_cuda:
@@ -808,12 +900,3 @@ class mLSTM(nn.Module):
             f"use_triton_kernels={self._use_triton_kernels}, "
             f"chunkwise_kernel={self._chunkwise_kernel!r}, chunk_size={self._chunk_size}"
         )
-
-    @torch.no_grad()
-    def clamp_forget_bias(self, max_val: float = _MAX_FORGET_BIAS) -> None:
-        """Clamps forget gate bias across all layers and directions."""
-        for layer_idx in range(self.num_layers):
-            for d in range(self.num_directions):
-                fg = getattr(self, f"fgate_{d}_{layer_idx}")
-                if fg.bias is not None:
-                    fg.bias.data.clamp_(-max_val, max_val)

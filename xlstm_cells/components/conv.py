@@ -2,6 +2,8 @@
 # Maximilian Beck, Korbinian Pöppel
 """Causal 1D depthwise convolution module for local context mixing."""
 
+from __future__ import annotations
+
 from typing import Optional, Tuple
 import torch
 from torch import nn

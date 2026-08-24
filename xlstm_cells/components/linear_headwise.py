@@ -2,6 +2,8 @@
 # Maximilian Beck, Korbinian Pöppel
 """Structured headwise linear expansion layer."""
 
+from __future__ import annotations
+
 import math
 from typing import Optional
 import torch

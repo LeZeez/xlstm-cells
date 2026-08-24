@@ -3,23 +3,23 @@ xLSTM Blocks: Official paper-compliant residual blocks (Beck et al., 2024).
 
 Architectures:
     mLSTMBlock (Pre Up-Projection, Figure 11):
-        x -> LayerNorm -+-> up_proj -> split -> z -> SiLU(z) -------------------------+
-                        |                                                             |
-                        +-> x_mlstm -+-> Conv1d -> SiLU -> q_proj, k_proj             |
-                                     |                    \                           |
-                                     +------------------> v_proj                      |
-                                                            \                         |
-                                                             mLSTM -> MultiHeadLN -> (+) -> (*) -> down_proj + x
-                                                                      (Token-wise)    ^      |
-                                                                                      |      |
-                                                              x_conv_act * LSkip -----+------+
+        x -> LayerNorm/RMSNorm -+-> up_proj -> split -> z -> SiLU(z) -------------------------+
+                                |                                                             |
+                                +-> x_mlstm -+-> Conv1d -> SiLU -> q_proj, k_proj             |
+                                             |                    \                           |
+                                             +------------------> v_proj                      |
+                                                                    \                         |
+                                                                     mLSTM -> MultiHeadLN -> (+) -> (*) -> down_proj + x
+                                                                              (Token-wise)    ^      |
+                                                                                              |      |
+                                                                      x_conv_act * LSkip -----+------+
 
     sLSTMBlock (Post Up-Projection, Figure 10):
-        x -> LayerNorm -+-> Conv1d -> SiLU -> igate, fgate (convolved)
-                        |
-                        +-------------------> zgate, ogate (unconvolved)
-                                                \
-                                                 sLSTM -> MultiHeadLN + x -> LayerNorm -> GeGLU MLP + x
+        x -> LayerNorm/RMSNorm -+-> Conv1d -> SiLU -> igate, fgate (convolved)
+                                |
+                                +-------------------> zgate, ogate (unconvolved)
+                                                        \
+                                                         sLSTM -> MultiHeadLN + x -> LayerNorm/RMSNorm -> GeGLU MLP + x
 """
 
 from __future__ import annotations
@@ -41,8 +41,9 @@ from ._utils import (
 from .components.conv import CausalConv1d
 from .components.feedforward import GatedFeedForward
 from .components.init import bias_linspace_init_, small_init_init_, wang_init_
-from .components.ln import LayerNorm, MultiHeadLayerNorm
-from .mlstm import _MAX_FORGET_BIAS, _MLSTM_CHUNK_SIZE, _BOUNDARY_RESET_LOGF, _EPS, mLSTMState
+from .components.ln import LayerNorm, MultiHeadLayerNorm, RMSNorm
+from .configs import mLSTMBlockConfig, sLSTMBlockConfig
+from .mlstm import _MLSTM_CHUNK_SIZE, _BOUNDARY_RESET_LOGF, _EPS, mLSTMState
 from .slstm import sLSTM, sLSTMState, _slstm_scan_sequential, _sLSTMCudaFunction
 
 try:
@@ -74,22 +75,27 @@ class mLSTMBlock(nn.Module):
         conv_kernel: 1D causal convolution kernel size. 0 disables convolution. Default: 4.
         dropout: Output dropout probability. Default: 0.0.
         bias: Whether linear projection layers use bias. Default: False.
+        norm_type: Normalization type ('layernorm' or 'rmsnorm'). Default: 'layernorm'.
         use_checkpoint: Whether to apply activation checkpointing. Default: False.
         use_triton_kernels: Whether to use mlstm_kernels Triton backend when available. Default: True.
         chunkwise_kernel: Triton chunk kernel name ("limit_chunk" or "xl_chunk"). Default: "xl_chunk".
         chunk_size: Sequence chunk size for chunked scan. Default: 128.
         eps: Denominator epsilon constant for stabilizer numerical stability. Default: 1e-6.
         num_blocks: Total number of stacked blocks in the model (for Wang init scaling). Default: 1.
+        qk_dim_factor: Optional factor for key/query dimensions (asymmetric memory).
+        v_dim_factor: Optional factor for value dimension (asymmetric memory).
+        config: Optional mLSTMBlockConfig object (overrides other args if provided).
     """
 
     def __init__(
         self,
-        d_model: int,
+        d_model: Optional[int] = None,
         expand_factor: Optional[float] = None,
         num_heads: int = 4,
         conv_kernel: int = 4,
         dropout: float = 0.0,
         bias: bool = False,
+        norm_type: str = "layernorm",
         use_checkpoint: bool = False,
         use_triton_kernels: bool = True,
         chunkwise_kernel: str = "xl_chunk",
@@ -97,85 +103,138 @@ class mLSTMBlock(nn.Module):
         eps: Optional[float] = None,
         num_blocks: int = 1,
         hidden_size: Optional[int] = None,
+        qk_dim_factor: Optional[float] = None,
+        v_dim_factor: Optional[float] = None,
+        config: Optional[mLSTMBlockConfig] = None,
     ):
         """Initializes paper-compliant mLSTMBlock."""
         super().__init__()
-        if not isinstance(d_model, int) or isinstance(d_model, bool) or d_model <= 0:
-            raise ValueError(f"mLSTMBlock: d_model must be a positive integer, got {d_model}")
-        if expand_factor is not None and hidden_size is not None:
+        if config is not None:
+            self.config = config
+        else:
+            if d_model is None:
+                raise ValueError("mLSTMBlock: d_model must be specified if config is None")
+            self.config = mLSTMBlockConfig(
+                d_model=d_model,
+                expand_factor=expand_factor,
+                hidden_size=hidden_size,
+                num_heads=num_heads,
+                conv_kernel=conv_kernel,
+                dropout=dropout,
+                bias=bias,
+                norm_type=norm_type,
+                use_checkpoint=use_checkpoint,
+                use_triton_kernels=use_triton_kernels,
+                chunkwise_kernel=chunkwise_kernel,
+                chunk_size=chunk_size,
+                eps=eps,
+                num_blocks=num_blocks,
+                qk_dim_factor=qk_dim_factor,
+                v_dim_factor=v_dim_factor,
+            )
+
+        d_model_val = self.config.d_model
+        if not isinstance(d_model_val, int) or isinstance(d_model_val, bool) or d_model_val <= 0:
+            raise ValueError(f"mLSTMBlock: d_model must be a positive integer, got {d_model_val}")
+        if self.config.expand_factor is not None and self.config.hidden_size is not None:
             raise ValueError(
                 "mLSTMBlock: conflicting arguments: cannot specify both 'expand_factor' and 'hidden_size'. "
                 "Specify only one."
             )
-        if not isinstance(num_heads, int) or isinstance(num_heads, bool) or num_heads <= 0:
-            raise ValueError(f"mLSTMBlock: num_heads must be a strictly positive integer, got {num_heads}")
-        if hidden_size is not None:
-            if not isinstance(hidden_size, int) or isinstance(hidden_size, bool) or hidden_size <= 0:
-                raise ValueError(f"mLSTMBlock: hidden_size must be a strictly positive integer, got {hidden_size}")
-            expanded = hidden_size
-        elif expand_factor is not None:
-            if not isinstance(expand_factor, (int, float)) or isinstance(expand_factor, bool) or not math.isfinite(expand_factor) or expand_factor <= 0:
-                raise ValueError(f"mLSTMBlock: expand_factor must be a positive finite number, got {expand_factor}")
-            expanded = round(expand_factor * d_model)
+        if not isinstance(self.config.num_heads, int) or isinstance(self.config.num_heads, bool) or self.config.num_heads <= 0:
+            raise ValueError(f"mLSTMBlock: num_heads must be a strictly positive integer, got {self.config.num_heads}")
+
+        if self.config.hidden_size is not None:
+            if not isinstance(self.config.hidden_size, int) or isinstance(self.config.hidden_size, bool) or self.config.hidden_size <= 0:
+                raise ValueError(f"mLSTMBlock: hidden_size must be a strictly positive integer, got {self.config.hidden_size}")
+            expanded = self.config.hidden_size
+        elif self.config.expand_factor is not None:
+            if not isinstance(self.config.expand_factor, (int, float)) or isinstance(self.config.expand_factor, bool) or not math.isfinite(self.config.expand_factor) or self.config.expand_factor <= 0:
+                raise ValueError(f"mLSTMBlock: expand_factor must be a positive finite number, got {self.config.expand_factor}")
+            expanded = round(self.config.expand_factor * d_model_val)
         else:
-            expanded = 2 * d_model  # Paper default (factor 2)
+            expanded = 2 * d_model_val  # Paper default (factor 2)
 
         if expanded <= 0:
             raise ValueError(f"mLSTMBlock: resolved hidden dimension must be strictly positive, got {expanded}")
-        if expanded % num_heads != 0:
+        if expanded % self.config.num_heads != 0:
             raise ValueError(
-                f"mLSTMBlock: hidden dimension ({expanded}) must be divisible by num_heads ({num_heads})"
+                f"mLSTMBlock: hidden dimension ({expanded}) must be divisible by num_heads ({self.config.num_heads})"
             )
-        if chunkwise_kernel not in _TRITON_CHUNKWISE_KERNELS:
+        if self.config.chunkwise_kernel not in _TRITON_CHUNKWISE_KERNELS:
             raise ValueError(
-                f"mLSTMBlock: unknown chunkwise_kernel {chunkwise_kernel!r}, "
+                f"mLSTMBlock: unknown chunkwise_kernel {self.config.chunkwise_kernel!r}, "
                 f"expected one of {list(_TRITON_CHUNKWISE_KERNELS.keys())}"
             )
-        if not isinstance(chunk_size, int) or isinstance(chunk_size, bool) or chunk_size <= 0:
-            raise ValueError(f"chunk_size must be a strictly positive integer, got {chunk_size}")
+        if not isinstance(self.config.chunk_size, int) or isinstance(self.config.chunk_size, bool) or self.config.chunk_size <= 0:
+            raise ValueError(f"chunk_size must be a strictly positive integer, got {self.config.chunk_size}")
 
-        if eps is None:
-            eps = _EPS
-        if not isinstance(eps, (int, float)) or isinstance(eps, bool) or not math.isfinite(eps) or eps <= 0:
+        eps_val = self.config.eps if self.config.eps is not None else _EPS
+        if not isinstance(eps_val, (int, float)) or isinstance(eps_val, bool) or not math.isfinite(eps_val) or eps_val <= 0:
             raise ValueError("eps must be a positive finite float")
 
-        self.d_model = d_model
+        self.d_model = d_model_val
         self.expanded = expanded
-        self.num_heads = num_heads
-        self.head_dim = expanded // num_heads
-        self.conv_kernel = conv_kernel
-        self.use_checkpoint = use_checkpoint
-        self._use_triton_kernels = use_triton_kernels and _HAS_MLSTM_KERNELS
-        self._chunkwise_kernel = chunkwise_kernel
-        self._chunk_size = chunk_size
-        self._eps = float(eps)
+        self.num_heads = self.config.num_heads
+        self.conv_kernel = self.config.conv_kernel
+        self.norm_type = self.config.norm_type
+        self.use_checkpoint = self.config.use_checkpoint
+        self._use_triton_kernels = self.config.use_triton_kernels and _HAS_MLSTM_KERNELS
+        self._chunkwise_kernel = self.config.chunkwise_kernel
+        self._chunk_size = self.config.chunk_size
+        self._eps = float(eps_val)
 
-        self.ln = LayerNorm(d_model, bias=False)
-        self.fused_proj = nn.Linear(d_model, 2 * expanded, bias=bias)
+        self.qk_dim_factor = self.config.qk_dim_factor
+        self.v_dim_factor = self.config.v_dim_factor
+        self.qk_dim = round(self.qk_dim_factor * self.expanded) if self.qk_dim_factor is not None else self.expanded
+        self.v_dim = round(self.v_dim_factor * self.expanded) if self.v_dim_factor is not None else self.expanded
 
-        if conv_kernel > 0:
-            self.conv = CausalConv1d(expanded, kernel_size=conv_kernel, bias=bias)
+        if self.qk_dim % self.num_heads != 0:
+            raise ValueError(f"mLSTMBlock: qk_dim ({self.qk_dim}) must be divisible by num_heads ({self.num_heads})")
+        if self.v_dim % self.num_heads != 0:
+            raise ValueError(f"mLSTMBlock: v_dim ({self.v_dim}) must be divisible by num_heads ({self.num_heads})")
+
+        self.head_dim = self.qk_dim // self.num_heads
+        self.v_head_dim = self.v_dim // self.num_heads
+
+        if self.norm_type == "rmsnorm":
+            self.ln = RMSNorm(self.d_model, eps=1e-6, weight=True, bias=False)
+        else:
+            self.ln = LayerNorm(self.d_model, eps=1e-5, weight=True, bias=False)
+
+        self.fused_proj = nn.Linear(self.d_model, 2 * self.expanded, bias=self.config.bias)
+
+        if self.conv_kernel > 0:
+            self.conv = CausalConv1d(self.expanded, kernel_size=self.conv_kernel, bias=self.config.bias)
         else:
             self.conv = None
 
-        self.q_proj = nn.Linear(expanded, expanded, bias=bias)
-        self.k_proj = nn.Linear(expanded, expanded, bias=bias)
-        self.v_proj = nn.Linear(expanded, expanded, bias=bias)
+        self.q_proj = nn.Linear(self.expanded, self.qk_dim, bias=self.config.bias)
+        self.k_proj = nn.Linear(self.expanded, self.qk_dim, bias=self.config.bias)
+        self.v_proj = nn.Linear(self.expanded, self.v_dim, bias=self.config.bias)
 
-        self.igate = nn.Linear(3 * expanded, num_heads, bias=True)
-        self.fgate = nn.Linear(3 * expanded, num_heads, bias=True)
+        if self.v_dim != self.expanded:
+            self.skip_proj = nn.Linear(self.expanded, self.v_dim, bias=self.config.bias)
+            self.gate_proj = nn.Linear(self.expanded, self.v_dim, bias=self.config.bias)
+        else:
+            self.skip_proj = None
+            self.gate_proj = None
 
-        self.gn = MultiHeadLayerNorm(ndim=expanded, weight=True, bias=False, eps=1e-5)
-        self.learnable_skip = nn.Parameter(torch.ones(expanded))
+        gate_in_dim = 2 * self.qk_dim + self.v_dim
+        self.igate = nn.Linear(gate_in_dim, self.num_heads, bias=True)
+        self.fgate = nn.Linear(gate_in_dim, self.num_heads, bias=True)
 
-        self.down_proj = nn.Linear(expanded, d_model, bias=bias)
-        self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
+        self.gn = MultiHeadLayerNorm(ndim=self.v_dim, weight=True, bias=False, eps=1e-5)
+        self.learnable_skip = nn.Parameter(torch.ones(self.v_dim))
+
+        self.down_proj = nn.Linear(self.v_dim, self.d_model, bias=self.config.bias)
+        self.dropout = nn.Dropout(self.config.dropout) if self.config.dropout > 0 else nn.Identity()
 
         self._mlstm_backend = None
         if self._use_triton_kernels:
             self._init_triton_backend()
 
-        self.reset_parameters(num_blocks=num_blocks)
+        self.reset_parameters(num_blocks=self.config.num_blocks)
 
     def _init_triton_backend(self) -> None:
         """Initializes Triton kernel backend configuration."""
@@ -202,6 +261,13 @@ class mLSTMBlock(nn.Module):
         if self.k_proj.bias is not None: nn.init.zeros_(self.k_proj.bias)
         if self.v_proj.bias is not None: nn.init.zeros_(self.v_proj.bias)
 
+        if self.skip_proj is not None:
+            small_init_init_(self.skip_proj.weight, dim=self.expanded)
+            if self.skip_proj.bias is not None: nn.init.zeros_(self.skip_proj.bias)
+        if self.gate_proj is not None:
+            small_init_init_(self.gate_proj.weight, dim=self.expanded)
+            if self.gate_proj.bias is not None: nn.init.zeros_(self.gate_proj.bias)
+
         nn.init.zeros_(self.fgate.weight)
         bias_linspace_init_(self.fgate.bias, start=3.4, end=6.0)
         nn.init.zeros_(self.igate.weight)
@@ -209,7 +275,7 @@ class mLSTMBlock(nn.Module):
 
         nn.init.ones_(self.learnable_skip)
 
-        wang_init_(self.down_proj.weight, dim=self.expanded, num_blocks=num_blocks)
+        wang_init_(self.down_proj.weight, dim=self.v_dim, num_blocks=num_blocks)
         if self.down_proj.bias is not None: nn.init.zeros_(self.down_proj.bias)
 
         self.ln.reset_parameters()
@@ -219,7 +285,7 @@ class mLSTMBlock(nn.Module):
 
     def init_state(self, batch_size: int, device=None, dtype=None) -> mLSTMState:
         """Initializes zero state object for mLSTM recurrence."""
-        return mLSTMState.init(batch_size, self.num_heads, self.head_dim, device, dtype)
+        return mLSTMState.init(batch_size, self.num_heads, self.head_dim, self.v_head_dim, device, dtype)
 
     def _run_core_native(
         self,
@@ -258,8 +324,8 @@ class mLSTMBlock(nn.Module):
         boundaries: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Executes official Triton mLSTM kernel."""
-        B, T, H, Dh = q.shape
-        sf = math.sqrt(Dh)
+        B, T, H, Dh_qk = q.shape
+        sf = math.sqrt(Dh_qk)
         k_scaled = k * sf
 
         f_tilde = f_raw
@@ -333,17 +399,19 @@ class mLSTMBlock(nn.Module):
 
         q = q_raw.view(B, T, self.num_heads, self.head_dim)
         k = (k_raw / math.sqrt(self.head_dim)).view(B, T, self.num_heads, self.head_dim)
-        v = v_raw.view(B, T, self.num_heads, self.head_dim)
+        v = v_raw.view(B, T, self.num_heads, self.v_head_dim)
 
         # Recurrence
         C_in = state.C.squeeze(0) if state.C.dim() == 5 else state.C
         n_in = state.n.squeeze(0) if state.n.dim() == 4 else state.n
         m_in = state.m.squeeze(0) if state.m.dim() == 3 else state.m
 
+        is_symmetric = (self.qk_dim == self.v_dim)
         use_triton = (
             self._use_triton_kernels
             and x.is_cuda
             and T % self._chunk_size == 0
+            and is_symmetric
             and not torch._dynamo.is_compiling()
         )
 
@@ -360,20 +428,21 @@ class mLSTMBlock(nn.Module):
         h_norm = self.gn(h_lstm, num_heads=self.num_heads)
 
         # Multiplicative Learnable Skip
-        h_skip = h_norm + (self.learnable_skip * x_conv_act)
+        if self.skip_proj is not None:
+            x_skip_in = self.skip_proj(x_conv_act)
+            z_in = self.gate_proj(z)
+        else:
+            x_skip_in = x_conv_act
+            z_in = z
+
+        h_skip = h_norm + (self.learnable_skip * x_skip_in)
 
         # Outer Swish / SiLU Gating
-        h_gated = h_skip * F.silu(z)
+        h_gated = h_skip * F.silu(z_in)
 
         out = self.dropout(self.down_proj(h_gated)) + residual
         new_state = mLSTMState(C_out, n_out, m_out)
         return out, new_state
-
-    @torch.no_grad()
-    def clamp_forget_bias(self, max_val: float = _MAX_FORGET_BIAS) -> None:
-        """Clamps forget gate bias to prevent numerical saturation."""
-        if self.fgate.bias is not None:
-            self.fgate.bias.data.clamp_(-max_val, max_val)
 
 
 # ---------------------------------------------------------------------------
@@ -390,94 +459,132 @@ class sLSTMBlock(nn.Module):
         mlp_factor: Multiplier for feedforward hidden dimension. Default: 4.0 / 3.0.
         dropout: Output dropout probability. Default: 0.0.
         bias: Whether linear projection layers use bias. Default: True.
+        norm_type: Normalization type ('layernorm' or 'rmsnorm'). Default: 'layernorm'.
         backend: sLSTM backend ("vanilla" or "cuda"). Default: "vanilla".
         use_checkpoint: Whether to apply activation checkpointing. Default: False.
         fast_mode: Whether to use compiled chunking for vanilla backend. Default: False.
         fast_chunk_size: Chunk size for fast_mode compilation. Default: 32.
         num_blocks: Total number of stacked blocks in the model. Default: 1.
+        hidden_size: Explicit intermediate projection dimension.
+        config: Optional sLSTMBlockConfig object (overrides other args if given).
     """
 
     def __init__(
         self,
-        d_model: int,
+        d_model: Optional[int] = None,
         num_heads: int = 4,
         conv_kernel: int = 4,
         mlp_factor: Optional[float] = None,
         dropout: float = 0.0,
         bias: bool = True,
+        norm_type: str = "layernorm",
         backend: str = "vanilla",
         use_checkpoint: bool = False,
         fast_mode: bool = False,
         fast_chunk_size: int = 32,
         num_blocks: int = 1,
         hidden_size: Optional[int] = None,
+        config: Optional[sLSTMBlockConfig] = None,
     ):
         """Initializes paper-compliant sLSTMBlock."""
         super().__init__()
-        if not isinstance(d_model, int) or isinstance(d_model, bool) or d_model <= 0:
-            raise ValueError(f"sLSTMBlock: d_model must be a positive integer, got {d_model}")
-        if not isinstance(num_heads, int) or isinstance(num_heads, bool) or num_heads <= 0:
-            raise ValueError(f"sLSTMBlock: num_heads must be a positive integer, got {num_heads}")
-        if d_model % num_heads != 0:
-            raise ValueError(f"sLSTMBlock: d_model ({d_model}) must be divisible by num_heads ({num_heads})")
-        if backend == "cuda" and fast_mode:
-            raise ValueError("sLSTMBlock: backend='cuda' cannot be combined with fast_mode=True.")
-        if backend not in ("vanilla", "cuda"):
-            raise ValueError(f"sLSTMBlock: unknown backend '{backend}'. Must be 'vanilla' or 'cuda'.")
-        if fast_mode:
-            if not isinstance(fast_chunk_size, int) or isinstance(fast_chunk_size, bool) or fast_chunk_size <= 0:
+        if config is not None:
+            self.config = config
+        else:
+            if d_model is None:
+                raise ValueError("sLSTMBlock: d_model must be specified if config is None")
+            self.config = sLSTMBlockConfig(
+                d_model=d_model,
+                num_heads=num_heads,
+                conv_kernel=conv_kernel,
+                mlp_factor=mlp_factor,
+                dropout=dropout,
+                bias=bias,
+                norm_type=norm_type,
+                backend=backend,
+                use_checkpoint=use_checkpoint,
+                fast_mode=fast_mode,
+                fast_chunk_size=fast_chunk_size,
+                num_blocks=num_blocks,
+                hidden_size=hidden_size,
+            )
+
+        d_model_val = self.config.d_model
+        if not isinstance(d_model_val, int) or isinstance(d_model_val, bool) or d_model_val <= 0:
+            raise ValueError(f"sLSTMBlock: d_model must be a positive integer, got {d_model_val}")
+        if not isinstance(self.config.num_heads, int) or isinstance(self.config.num_heads, bool) or self.config.num_heads <= 0:
+            raise ValueError(f"sLSTMBlock: num_heads must be a positive integer, got {self.config.num_heads}")
+        if d_model_val % self.config.num_heads != 0:
+            raise ValueError(f"sLSTMBlock: d_model ({d_model_val}) must be divisible by num_heads ({self.config.num_heads})")
+        fast_mode_val = self.config.fast_mode
+        if self.config.backend == "cuda" and fast_mode_val:
+            warnings.warn(
+                "sLSTMBlock: backend='cuda' does not use fast_mode (fast_mode is for torch.compile chunking under backend='vanilla'). "
+                "fast_mode will be ignored.",
+                stacklevel=2,
+            )
+            fast_mode_val = False
+        if self.config.backend not in ("vanilla", "cuda"):
+            raise ValueError(f"sLSTMBlock: unknown backend '{self.config.backend}'. Must be 'vanilla' or 'cuda'.")
+        if fast_mode_val:
+            if not isinstance(self.config.fast_chunk_size, int) or isinstance(self.config.fast_chunk_size, bool) or self.config.fast_chunk_size <= 0:
                 raise ValueError(
-                    f"sLSTMBlock: fast_chunk_size must be a strictly positive integer when fast_mode=True, got {fast_chunk_size}."
+                    f"sLSTMBlock: fast_chunk_size must be a strictly positive integer when fast_mode=True, got {self.config.fast_chunk_size}."
                 )
 
-        if mlp_factor is not None and hidden_size is not None:
+        if self.config.mlp_factor is not None and self.config.hidden_size is not None:
             raise ValueError(
                 "sLSTMBlock: conflicting arguments: cannot specify both 'mlp_factor' and 'hidden_size'. "
                 "Specify only one."
             )
 
-        self.d_model = d_model
-        self.num_heads = num_heads
-        self.head_dim = d_model // num_heads
-        self.backend = backend
-        self.use_checkpoint = use_checkpoint
-        self.fast_mode = fast_mode
-        self.fast_chunk_size = fast_chunk_size
+        self.d_model = d_model_val
+        self.num_heads = self.config.num_heads
+        self.head_dim = d_model_val // self.num_heads
+        self.backend = self.config.backend
+        self.norm_type = self.config.norm_type
+        self.use_checkpoint = self.config.use_checkpoint
+        self.fast_mode = fast_mode_val
+        self.fast_chunk_size = self.config.fast_chunk_size
 
-        self.ln = LayerNorm(d_model, bias=False)
+        if self.norm_type == "rmsnorm":
+            self.ln = RMSNorm(self.d_model, eps=1e-6, weight=True, bias=False)
+            self.ffn_norm = RMSNorm(self.d_model, eps=1e-6, weight=True, bias=False)
+        else:
+            self.ln = LayerNorm(self.d_model, eps=1e-5, weight=True, bias=False)
+            self.ffn_norm = LayerNorm(self.d_model, eps=1e-5, weight=True, bias=False)
 
-        if conv_kernel > 0:
-            self.conv = CausalConv1d(d_model, kernel_size=conv_kernel, bias=bias)
+        if self.config.conv_kernel > 0:
+            self.conv = CausalConv1d(self.d_model, kernel_size=self.config.conv_kernel, bias=self.config.bias)
         else:
             self.conv = None
 
         # Decoupled Figure 10 projections: (i, f) from conv; (z, o) from unconvolved
-        self.W_if = nn.Linear(d_model, 2 * d_model, bias=bias)
-        self.W_zo = nn.Linear(d_model, 2 * d_model, bias=bias)
-        self.R_fused = nn.Parameter(torch.empty(num_heads, self.head_dim, 4 * self.head_dim))
+        self.W_if = nn.Linear(self.d_model, 2 * self.d_model, bias=self.config.bias)
+        self.W_zo = nn.Linear(self.d_model, 2 * self.d_model, bias=self.config.bias)
+        self.R_fused = nn.Parameter(torch.empty(self.num_heads, self.head_dim, 4 * self.head_dim))
 
-        self.gn = MultiHeadLayerNorm(ndim=d_model, weight=True, bias=False, eps=1e-5)
+        self.gn = MultiHeadLayerNorm(ndim=self.d_model, weight=True, bias=False, eps=1e-5)
 
-        # Post-sLSTM GeGLU Feedforward
-        self.ffn_norm = LayerNorm(d_model, bias=False)
+        # Post-sLSTM GeGLU Feedforward (Figure 10)
         self.ffn = GatedFeedForward(
-            d_model=d_model,
-            proj_factor=mlp_factor if hidden_size is None else None,
-            proj_up_dim=hidden_size,
+            d_model=self.d_model,
+            proj_factor=self.config.mlp_factor if self.config.hidden_size is None else None,
+            proj_up_dim=self.config.hidden_size,
             act_fn="gelu",
-            dropout=dropout,
-            bias=bias,
-            num_blocks=num_blocks,
+            dropout=self.config.dropout,
+            bias=self.config.bias,
+            num_blocks=self.config.num_blocks,
         )
-        self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
+        self.dropout = nn.Dropout(self.config.dropout) if self.config.dropout > 0 else nn.Identity()
 
         self._compiled_scans = {}
         self._cuda_kernel = None
         self._cuda_funcs = {}
-        if backend == "cuda":
+        if self.backend == "cuda":
             self._init_cuda_backend()
 
-        self.reset_parameters(num_blocks=num_blocks)
+        self.reset_parameters(num_blocks=self.config.num_blocks)
 
     def _init_cuda_backend(self) -> None:
         """Compiles and loads the official sLSTM CUDA C++ extension."""
@@ -702,10 +809,3 @@ class sLSTMBlock(nn.Module):
         out = x_mid + x_mlp
         new_state = sLSTMState(c_out, n_out, m_out, h_out)
         return out, new_state
-
-    @torch.no_grad()
-    def clamp_forget_bias(self, max_val: float = _MAX_FORGET_BIAS) -> None:
-        """Clamps forget gate bias to prevent numerical saturation."""
-        HS = self.d_model
-        if self.W_if.bias is not None:
-            self.W_if.bias.data[HS:2*HS].clamp_(-max_val, max_val)

@@ -8,5 +8,4 @@ build/
 *.pth
 .venv/
 venv/
-tests/
 temp*

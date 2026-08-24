@@ -3,7 +3,7 @@
 Fast, pip-installable mLSTM and sLSTM cells with pure PyTorch foundation and an `nn.LSTM`-compatible interface, implementing the xLSTM architecture (Beck et al., 2024).
 
 > **Warning: Experimental**
-> This repository is experimental and under active development. Certain edge configurations, extreme scaling regimes, or custom hardware setups may exhibit instability. For previous release classes and historical checkpoints, checkout the `old-classes-v1` branch (`pip install git+https://github.com/LeZeez/xlstm-cells.git@old-classes-v1`).
+> This repository is experimental and under active development. Certain edge configurations, extreme scaling regimes, or custom hardware setups may exhibit instability.
 
 ```bash
 pip install git+https://github.com/LeZeez/xlstm-cells.git
@@ -12,38 +12,62 @@ pip install git+https://github.com/LeZeez/xlstm-cells.git
 ---
 
 ## Why?
-As much as I found `NX-AI/xlstm` a strong and robust repo, as much I as I found it rigid and confusing, at least for me. I found `nn.LSTM`-like classes much easier to build with and add custom features in.
+As much as I admire [NX-AI/xlstm](https://github.com/NX-AI/xlstm) as a strong and robust repo, I found it rigid and confusing, at least for me. I found `nn.LSTM`-like classes much easier to build with and add custom features to. This repository targets learners and builders, providing a balanced middle ground, featuring:
 
-## Core Philosophy
-
-1. **Pure PyTorch Base:** Every module works out-of-the-box with standard PyTorch on CPU and GPU without requiring external compilers or C++ toolchains.
-2. **Optional Official Backends:** Integrates optional high-performance backends taken directly from the official NX-AI repositories:
-   - **mLSTM:** Optional Triton chunkwise kernels (`xl_chunk` and `limit_chunk`) via `mlstm_kernels`.
-   - **sLSTM:** Optional custom CUDA C++ extension with JIT compilation.
+1. **Pure PyTorch Base:** Every module works out-of-the-box with standard PyTorch on CPU and GPU without requiring external compilers or C++ toolchains. Good for learners.
+2. **Optional Backends:** Integrates optional high-performance backends taken directly from the official NX-AI repositories:
+   - **mLSTM:** Optional Triton chunkwise kernels (`xl_chunk` and `limit_chunk`) via [mlstm_kernels](https://github.com/NX-AI/mlstm_kernels).
+   - **sLSTM:** Optional custom CUDA C++ extension with JIT compilation, taken from [NX-AI/xlstm](https://github.com/NX-AI/xlstm).
+3. **Modern Architectures & Blocks:** Support for paper-compliant residual blocks (`mLSTMBlock`, `sLSTMBlock`) and official Large residual blocks (`xLSTMLargeBlock`) featuring SwiGLU feedforward, RMSNorm/LayerNorm options, asymmetric matrix memory dimensions, gate soft-capping, document packing (`boundaries=`), and TBPTT state management (`detach_states`, `zero_rows`).
+4. **Auto-Fallback:** Zero-friction execution across training and generation. If Triton is unaligned with chunk size (e.g., generation step `T=1` or short prefill `T < chunk_size`), running on CPU, or compiling under `torch.compile`, the model automatically and transparently routes through the high-performance native parallel scan (emitting a standard runtime warning on CPU fallback).
 
 ---
 
-## Classes
+## Overview of Classes
 
-| Class | Signature | Description |
+Base classes in `xlstm-cells` support dual initialization:
+1. **Direct keyword arguments:** `mLSTMBlock(d_model=512, num_heads=8)`
+2. **Dedicated config objects:** `mLSTMBlock(config=mLSTMBlockConfig(d_model=512, num_heads=8))`
+
+---
+
+### 1. Single-Step Recurrent Cells (nn.LSTMCell compatible)
+
+| Class | Dedicated Config | Description |
 |---|---|---|
-| `mLSTMCell` | `mLSTMCell(input_size, hidden_size, num_heads=4)` | Single-step bare matrix memory cell |
-| `sLSTMCell` | `sLSTMCell(input_size, hidden_size, num_heads=4)` | Single-step bare scalar memory cell with block-diagonal recurrence |
-| `mLSTM` | `mLSTM(input_size, hidden_size, num_layers=1, num_heads=4, ...)` | Bare multi-layer sequence mLSTM (Triton & native chunked scan) |
-| `sLSTM` | `sLSTM(input_size, hidden_size, num_layers=1, num_heads=4, ...)` | Bare multi-layer sequence sLSTM (compiled vanilla scan & CUDA backend) |
-| `mLSTMBlock` | `mLSTMBlock(d_model, expand_factor=2, num_heads=4, ...)` | Official Figure 11 residual block with pre up-projection |
-| `sLSTMBlock` | `sLSTMBlock(d_model, num_heads=4, mlp_factor=4/3, ...)` | Official Figure 10 residual block with post up-projection GeGLU MLP |
-| `mLSTMState` | Dataclass with `.C`, `.n`, `.m` fields | Matrix memory state |
-| `sLSTMState` | Dataclass with `.c`, `.n`, `.m`, `.h` fields | Scalar memory state |
+| `mLSTMCell` | `mLSTMCellConfig` | Single-step bare matrix memory cell with exp-stabilizer m |
+| `sLSTMCell` | `sLSTMCellConfig` | Single-step bare scalar memory cell with block-diagonal recurrence |
+
+### 2. Multi-Layer Sequence Models (nn.LSTM compatible)
+
+| Class | Dedicated Config | Description |
+|---|---|---|
+| `mLSTM` | `mLSTMConfig` | Multi-layer sequence mLSTM (Triton & native chunked parallel scan) |
+| `sLSTM` | `sLSTMConfig` | Multi-layer sequence sLSTM (native/compiled vanilla scan & CUDA backend) |
+
+### 3. Residual Blocks (Beck et al., 2024)
+
+| Class | Dedicated Config | Description |
+|---|---|---|
+| `mLSTMBlock` | `mLSTMBlockConfig` | [Official Figure 11 block](https://arxiv.org/pdf/2405.04517#page=30) (Pre up-projection, conv q/k, SiLU) |
+| `sLSTMBlock` | `sLSTMBlockConfig` | [Official Figure 10 block](https://arxiv.org/pdf/2405.04517#page=29) (Post up-projection, conv i/f, GeGLU MLP) |
+| `xLSTMLargeBlock` | `xLSTMLargeBlockConfig` | Official Large residual block (Pre RMSNorm, SwiGLU, gate soft-capping) |
+
+### 4. State Data Classes
+
+| Class | Contained Fields | Description |
+|---|---|---|
+| `mLSTMState` | `.C`, `.n`, `.m` | Matrix memory state (`C` shape: `[B, H, Dh_qk, Dh_v]`, `n`: `[B, H, Dh_qk]`, `m`: `[B, H]`) |
+| `sLSTMState` | `.c`, `.n`, `.m`, `.h` | Scalar memory state (`c`, `n`, `m`, `h` shape: `[B, H, Dh]`) |
 
 ---
 
-## Functions
+## State & Training Functions
 
-| Function | Usage |
-|---|---|
-| `detach_states` | `detach_states(states)` -- recursively detach all state tensors in nested structures |
-| `zero_rows` | `zero_rows(states, mask)` -- in-place zero selected batch rows across states |
+| Function | Usage | Description |
+|---|---|---|
+| `detach_states` | `detach_states(states)` | recursively detach all state tensors in nested tuples, lists, and dicts |
+| `zero_rows` | `zero_rows(states, mask)` | in-place zero selected batch rows across states for continuous batching |
 
 ---
 
@@ -108,10 +132,12 @@ states = detach_states(states)
 
 ---
 
-## Performance & Backends
+## Performance, Backends & Fallback
 
-### mLSTM: Triton Acceleration (`mlstm_kernels`)
-Install `mlstm_kernels` for hardware-accelerated chunkwise mLSTM recurrence on NVIDIA GPUs:
+### mLSTM: Triton Acceleration & Transparent Fallback
+When `mlstm_kernels` is installed, mLSTM layers and blocks execute hardware-accelerated Triton chunkwise kernels on NVIDIA GPUs when inputs are aligned with the chunk size.
+
+If the sequence length is unaligned (e.g., single-step autoregressive generation `T=1` or short prefill `T < chunk_size`), running on CPU, or under `torch.compile`, the model automatically falls back to the native parallel chunked scan (emitting a runtime warning when falling back from CUDA Triton to CPU scan).
 
 ```bash
 pip install mlstm_kernels
@@ -122,50 +148,57 @@ mLSTM(128, 256, use_triton_kernels=True, chunkwise_kernel="xl_chunk", chunk_size
 mLSTMBlock(512, use_triton_kernels=True, chunkwise_kernel="xl_chunk", chunk_size=128, eps=1e-6)
 ```
 
-If Triton is unavailable (CPU input, sequence length non-divisible by chunk size, or under `torch.compile`), it falls back automatically to the native chunked-parallel scan.
-
 ### sLSTM: Compiled Vanilla Scan & CUDA Kernel
 * **`backend="vanilla"` (Default):** Pure PyTorch sequential scan. Set `fast_mode=True` to compile the scan chunk-by-chunk via `torch.compile(dynamic=False)`:
   ```python
   sLSTM(128, 256, backend="vanilla", fast_mode=True, fast_chunk_size=32)
   sLSTMBlock(512, backend="vanilla", fast_mode=True, fast_chunk_size=32)
   ```
-* **`backend="cuda"` (Optional):** Compiles the official C++/CUDA extension from source on the fly. Note: `fast_mode` must be False when using the CUDA backend.
+* **`backend="cuda"` (Optional):** Compiles the official C++/CUDA extension from source on the fly. 
+
+*Note: `fast_mode` must be False when using the CUDA backend. Otherwise, it will be ignored.*
 
 ### Activation Checkpointing
-Reduces peak activation memory by recomputing forward steps during backward:
+Reduces peak activation memory by recomputing forward steps during backward pass:
 
 ```python
 mLSTMBlock(512, use_checkpoint=True)
 sLSTMBlock(512, use_checkpoint=True)
 ```
 
+*Note: `use_checkpoint=True` adds latency and is often slower than `use_checkpoint=False`. Only use it when you have no memory for small batch size (e.g., <= 2)*
+
 ### Packed Sequences Without Padding (`boundaries`)
-Both `mLSTMBlock` and `sLSTMBlock` support document packing via the `boundaries` boolean mask:
+All blocks (`mLSTMBlock`, `sLSTMBlock`, `xLSTMLargeBlock`) and sequence models support document packing via the `boundaries` boolean mask:
 
 ```python
 boundaries = torch.zeros(B, T, dtype=torch.bool, device=x.device)
-boundaries[:, boundary_positions] = True  # True at the FIRST token of every packed document
+boundaries[:, boundary_positions] = True  # True at the FIRST token of every packed document (BOS recommended here)
 
 out, state = block(x, state, boundaries=boundaries)
 ```
-At boundary positions, the forget pre-activation is set to `-1000.0`, unconditionally resetting the recurrent memory without cross-document pollution.
+At boundary positions, the forget pre-activation is set to `-1000.0`, unconditionally resetting the recurrent memory and eliminating cross-document attention and gradient leakage.
 
 ---
 
-## Development & Testing
+## Testing
 
 ```bash
 git clone https://github.com/LeZeez/xlstm-cells.git
 cd xlstm-cells
-pip install -e ".[dev]"
 pytest
 ```
 
 ---
 
+## License & Attribution
+
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+
+Portions of this codebase (components, normalization layers, initialization routines, and CUDA kernels) are derived from [NX-AI/xlstm](https://github.com/NX-AI/xlstm), licensed under the Apache License, Version 2.0. See the [NOTICE](NOTICE) file for full copyright and attribution notices.
+
+---
+
 ## Reference
 
-Beck, M., Pöppel, K., Spanring, M., Auer, A., Prudnikova, O., Kopp, M.,
-Klambauer, G., Brandstetter, J., & Hochreiter, S. (2024). xLSTM: Extended
-Long Short-Term Memory. *arXiv preprint arXiv:2405.04517*.
+Beck, M., Pöppel, K., Spanring, M., Auer, A., Prudnikova, O., Kopp, M., Klambauer, G., Brandstetter, J., & Hochreiter, S. (2024). xLSTM: Extended Long Short-Term Memory. *arXiv preprint arXiv:2405.04517*.
