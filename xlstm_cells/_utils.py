@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import torch
 from enum import Enum
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 
 # ---------------------------------------------------------------------------
@@ -39,6 +39,7 @@ _GLOBAL_BOUNDS_MODE: PackedBoundariesMode = PackedBoundariesMode.USE_REENTRANT_C
 
 
 def get_packed_boundaries_override_mode() -> PackedBoundariesMode:
+    """Returns the current global packed boundaries override mode."""
     return _GLOBAL_BOUNDS_MODE
 
 
@@ -84,13 +85,13 @@ def detach_states(
 def zero_rows(
     states: Union[Dict, List, Tuple, Any],
     mask: torch.Tensor,
+    batch_dim: Optional[int] = None,
 ) -> None:
     """In-place zero selected batch rows across a nested state structure.
 
     ``mask`` must be a boolean tensor of shape ``(batch_size,)``.
-    For every tensor field inside state dataclasses, ``tensor[:, mask] = 0``
-    is applied --- this zeroes the masked rows while preserving the leading
-    dimension (num_directions) and all other dimensions.
+    Supports both 3D/4D cell & block states ``(B, ...)`` and 4D/5D multi-layer
+    sequence states ``(D, B, ...)``.
 
     .. warning::
         Only call on detached states.  If any tensor in the state is still
@@ -103,10 +104,10 @@ def zero_rows(
     """
     if isinstance(states, dict):
         for v in states.values():
-            zero_rows(v, mask)
+            zero_rows(v, mask, batch_dim=batch_dim)
     elif isinstance(states, (list, tuple)):
         for v in states:
-            zero_rows(v, mask)
+            zero_rows(v, mask, batch_dim=batch_dim)
     elif hasattr(states, "__dataclass_fields__"):
         for fname in states.__dataclass_fields__:
             tensor = getattr(states, fname)
@@ -115,4 +116,58 @@ def zero_rows(
                     f"zero_rows: tensor '{fname}' requires grad. "
                     f"Detach states first with detach_states()."
                 )
-            tensor[:, mask] = 0
+            if batch_dim is not None:
+                idx = [slice(None)] * tensor.dim()
+                idx[batch_dim] = mask
+                tensor[tuple(idx)] = 0
+            else:
+                dim0_match = (tensor.shape[0] == mask.shape[0])
+                dim1_match = (tensor.dim() in (4, 5) and tensor.shape[1] == mask.shape[0])
+                if dim0_match and dim1_match:
+                    raise ValueError(
+                        f"zero_rows: ambiguous batch dimension for tensor '{fname}' with shape {list(tensor.shape)} "
+                        f"(both dim 0 and dim 1 match mask length {mask.shape[0]}). Specify batch_dim explicitly."
+                    )
+                elif dim1_match:
+                    tensor[:, mask] = 0
+                elif dim0_match:
+                    tensor[mask] = 0
+                else:
+                    raise ValueError(
+                        f"zero_rows: tensor '{fname}' shape {list(tensor.shape)} does not match mask length {mask.shape[0]}"
+                    )
+
+
+def normalize_and_validate_num_heads(
+    num_heads: Union[int, Sequence[int]],
+    num_layers: int,
+    hidden_size: int,
+    class_name: str,
+) -> List[int]:
+    """Validates and normalizes num_heads into a list of ints per layer."""
+    if not isinstance(num_layers, int) or isinstance(num_layers, bool) or num_layers <= 0:
+        raise ValueError(f"{class_name}: num_layers must be a strictly positive integer, got {num_layers}")
+    if not isinstance(hidden_size, int) or isinstance(hidden_size, bool) or hidden_size <= 0:
+        raise ValueError(f"{class_name}: hidden_size must be a strictly positive integer, got {hidden_size}")
+    if isinstance(num_heads, int) and not isinstance(num_heads, bool):
+        if num_heads <= 0:
+            raise ValueError(f"{class_name}: num_heads must be a strictly positive integer, got {num_heads}")
+        heads_list = [num_heads] * num_layers
+    elif isinstance(num_heads, (list, tuple)):
+        if len(num_heads) != num_layers:
+            raise ValueError(
+                f"{class_name}: length of num_heads ({len(num_heads)}) must match num_layers ({num_layers})"
+            )
+        for h in num_heads:
+            if not isinstance(h, int) or isinstance(h, bool) or h <= 0:
+                raise ValueError(f"{class_name}: every element of num_heads must be a positive integer, got {h}")
+        heads_list = list(num_heads)
+    else:
+        raise TypeError(f"{class_name}: num_heads must be an integer or a sequence of integers, got {type(num_heads)}")
+
+    for idx, h in enumerate(heads_list):
+        if hidden_size % h != 0:
+            raise ValueError(
+                f"{class_name}: hidden_size ({hidden_size}) must be divisible by num_heads at layer {idx} ({h})"
+            )
+    return heads_list

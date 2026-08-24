@@ -33,8 +33,12 @@ from ._utils import (
     get_packed_boundaries_override_mode,
     set_packed_boundaries_override_mode,
 )
+from .components.ln import LayerNorm, MultiHeadLayerNorm
+from .components.conv import CausalConv1d, conv1d_step
+from .components.feedforward import GatedFeedForward
+from .components.linear_headwise import LinearHeadwiseExpand
 
-__version__ = "0.5.6"
+__version__ = "0.6.0"
 __all__ = [
     "mLSTMCell",
     "mLSTM",
@@ -44,6 +48,12 @@ __all__ = [
     "sLSTMState",
     "mLSTMBlock",
     "sLSTMBlock",
+    "LayerNorm",
+    "MultiHeadLayerNorm",
+    "CausalConv1d",
+    "conv1d_step",
+    "GatedFeedForward",
+    "LinearHeadwiseExpand",
     "detach_states",
     "zero_rows",
     "PackedBoundariesMode",
