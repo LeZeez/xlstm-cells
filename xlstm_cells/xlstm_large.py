@@ -10,6 +10,7 @@ from typing import Optional, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.utils.checkpoint
 
 from .components.conv import CausalConv1d
 from .components.feedforward import SwiGLUFeedForward
