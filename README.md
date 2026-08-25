@@ -156,7 +156,7 @@ mLSTMBlock(512, use_triton_kernels=True, chunkwise_kernel="xl_chunk", chunk_size
   ```
 * **`backend="cuda"` (Optional):** Compiles the official C++/CUDA extension from source on the fly. 
 
-*Note: `fast_mode` must be False when using the CUDA backend. Otherwise, it will be ignored.*
+*Note: When using backend="cuda", the constructor automatically emits a warning and forces fast_mode to False.*
 
 ### Activation Checkpointing
 Reduces peak activation memory by recomputing forward steps during backward pass:
@@ -164,6 +164,7 @@ Reduces peak activation memory by recomputing forward steps during backward pass
 ```python
 mLSTMBlock(512, use_checkpoint=True)
 sLSTMBlock(512, use_checkpoint=True)
+xLSTMLargeBlock(config=xLSTMLargeBlockConfig(embedding_dim=512, use_checkpoint=True))
 ```
 
 *Note: `use_checkpoint=True` adds latency and is often slower than `use_checkpoint=False`. Only use it when you have no memory for small batch size (e.g., <= 2)*

@@ -88,6 +88,7 @@ def test_slstm_block_forward_backward():
     assert torch.isfinite(x.grad).all()
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for backend='cuda'")
 def test_slstm_cuda_backend_warns_and_ignores_fast_mode():
     """backend='cuda' with fast_mode=True must warn and ignore fast_mode without raising."""
     with pytest.warns(UserWarning, match="does not use fast_mode"):

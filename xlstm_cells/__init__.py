@@ -2,7 +2,7 @@
 xlstm-cells: Fast, pip-installable mLSTM and sLSTM cells with nn.LSTM-compatible interface.
 
 Usage:
-    from xlstm_cells import mLSTM, sLSTM, mLSTMCell, sLSTMCell, mLSTMBlock, sLSTMBlock, xLSTMLargeBlock
+    from xlstm_cells import mLSTM, sLSTM, mLSTMCell, sLSTMCell, mLSTMBlock, sLSTMBlock, xLSTMLargeBlock, xLSTMLargeBlockConfig
 
     # Full sequence (like nn.LSTM)
     layer = mLSTM(input_size=128, hidden_size=256, num_layers=2, bidirectional=True)

@@ -193,3 +193,21 @@ def test_mlstm_block_asymmetric_learnable_skip_grad():
     assert block.learnable_skip.grad is not None
     assert torch.isfinite(block.learnable_skip.grad).all()
     assert (block.learnable_skip.grad.abs() > 0).any()
+
+
+def test_xlstm_large_block_use_checkpoint():
+    """Test xLSTMLargeBlock with use_checkpoint=True completes forward and backward."""
+    B, T, D = 2, 16, 64
+    cfg = xLSTMLargeBlockConfig(
+        embedding_dim=D,
+        num_heads=4,
+        num_blocks=1,
+        use_checkpoint=True,
+    )
+    block = xLSTMLargeBlock(cfg).to(DEV)
+    block.train()
+    x = torch.randn(B, T, D, device=DEV, requires_grad=True)
+    out, st = block(x)
+    assert out.shape == (B, T, D)
+    out.sum().backward()
+    assert x.grad is not None and torch.isfinite(x.grad).all()

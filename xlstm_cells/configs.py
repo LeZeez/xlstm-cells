@@ -175,9 +175,9 @@ class sLSTMBlockConfig:
 @dataclass
 class xLSTMLargeBlockConfig:
     """Configuration for xLSTMLargeBlock residual block."""
-    embedding_dim: int = 4096
+    embedding_dim: Optional[int] = None
     num_heads: int = 8
-    num_blocks: int = 32
+    num_blocks: Optional[int] = None
     use_bias: bool = False
     norm_eps: float = 1e-6
     norm_reduction_force_float32: bool = True
@@ -205,7 +205,6 @@ class xLSTMLargeBlockConfig:
     weight_mode: str = "single"  # "single" or "fused"
     conv1d_kernel_size: int = 0
     norm_type: str = "rmsnorm"   # "rmsnorm" or "layernorm"
-    act_fn: str = "silu"
     use_checkpoint: bool = False
     dropout: float = 0.0
 
@@ -214,18 +213,19 @@ class xLSTMLargeBlockConfig:
     num_hidden_layers: Optional[int] = None
 
     def __post_init__(self):
-        if self.hidden_size is not None:
-            if self.embedding_dim != 4096 and self.hidden_size != self.embedding_dim:
-                raise ValueError(
-                    f"xLSTMLargeBlockConfig: conflicting values: embedding_dim={self.embedding_dim} and hidden_size={self.hidden_size}"
-                )
-            self.embedding_dim = self.hidden_size
-        if self.num_hidden_layers is not None:
-            if self.num_blocks != 32 and self.num_hidden_layers != self.num_blocks:
-                raise ValueError(
-                    f"xLSTMLargeBlockConfig: conflicting values: num_blocks={self.num_blocks} and num_hidden_layers={self.num_hidden_layers}"
-                )
-            self.num_blocks = self.num_hidden_layers
+        if self.embedding_dim is not None and self.hidden_size is not None and self.embedding_dim != self.hidden_size:
+            raise ValueError(
+                f"xLSTMLargeBlockConfig: conflicting values: embedding_dim={self.embedding_dim} and hidden_size={self.hidden_size}"
+            )
+        if self.embedding_dim is None:
+            self.embedding_dim = self.hidden_size if self.hidden_size is not None else 4096
+
+        if self.num_blocks is not None and self.num_hidden_layers is not None and self.num_blocks != self.num_hidden_layers:
+            raise ValueError(
+                f"xLSTMLargeBlockConfig: conflicting values: num_blocks={self.num_blocks} and num_hidden_layers={self.num_hidden_layers}"
+            )
+        if self.num_blocks is None:
+            self.num_blocks = self.num_hidden_layers if self.num_hidden_layers is not None else 32
 
         if self.embedding_dim <= 0:
             raise ValueError(f"xLSTMLargeBlockConfig: embedding_dim must be positive, got {self.embedding_dim}")

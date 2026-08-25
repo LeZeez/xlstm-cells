@@ -295,6 +295,7 @@ class xLSTMLargeBlock(nn.Module):
             self.norm_mlstm = LayerNorm(config.embedding_dim, eps=config.norm_eps, weight=True, bias=config.use_bias)
             self.norm_ffn = LayerNorm(config.embedding_dim, eps=config.norm_eps, weight=True, bias=config.use_bias)
 
+        self.use_checkpoint = config.use_checkpoint
         self.mlstm_layer = xLSTMLargeLayer(config)
 
         self.ffn = SwiGLUFeedForward(
@@ -310,7 +311,7 @@ class xLSTMLargeBlock(nn.Module):
     def init_state(self, batch_size: int, device=None, dtype=None) -> mLSTMState:
         return self.mlstm_layer.init_state(batch_size, device=device, dtype=dtype)
 
-    def forward(
+    def _forward_body(
         self,
         x: torch.Tensor,
         state: Optional[mLSTMState] = None,
@@ -323,3 +324,15 @@ class xLSTMLargeBlock(nn.Module):
         x_ffn = self.norm_ffn(x)
         x = x + self.ffn(x_ffn)
         return x, new_state
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        state: Optional[mLSTMState] = None,
+        boundaries: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, mLSTMState]:
+        if self.use_checkpoint and self.training and x.requires_grad:
+            return torch.utils.checkpoint.checkpoint(
+                self._forward_body, x, state, boundaries, use_reentrant=False
+            )
+        return self._forward_body(x, state=state, boundaries=boundaries)
