@@ -12,7 +12,7 @@ pip install git+https://github.com/LeZeez/xlstm-cells.git
 ---
 
 ## Why?
-As much as I admire [NX-AI/xlstm](https://github.com/NX-AI/xlstm) as a strong and robust repo, I found it rigid and confusing, at least for me. I found `nn.LSTM`-like classes much easier to build with and add custom features to. This repository targets learners and builders, providing a balanced middle ground, featuring:
+[NX-AI/xlstm](https://github.com/NX-AI/xlstm) is a very strong and robust repository, but I found `nn.LSTM`-like classes much easier to build with and add custom features to. This repository targets learners and builders, providing a balanced middle ground, featuring:
 
 1. **Pure PyTorch Base:** Every module works out-of-the-box with standard PyTorch on CPU and GPU without requiring external compilers or C++ toolchains. Good for learners.
 2. **Optional Backends:** Integrates optional high-performance backends taken directly from the official NX-AI repositories:
