@@ -1,18 +1,21 @@
 # Copyright (c) NXAI GmbH and its affiliates 2024
 # Maximilian Beck
-"""Gated feedforward (GeGLU) module for sLSTM blocks."""
+"""Feedforward modules for xLSTM: GatedFeedForward (GeGLU/SwiGLU) and SwiGLUFeedForward."""
+
+from __future__ import annotations
 
 import math
+from typing import Optional
 import torch
 from torch import nn
 import torch.nn.functional as F
 
-from typing import Optional
 from .init import small_init_init_, wang_init_
+from .utils import round_up_to_next_multiple_of
 
 
 class GatedFeedForward(nn.Module):
-    """Gated FeedForward (GeGLU) layer for post up-projection in sLSTM blocks.
+    """Gated FeedForward layer (GeGLU / SwiGLU) for post up-projection in sLSTM blocks.
 
     Args:
         d_model: Model hidden dimension.
@@ -63,6 +66,9 @@ class GatedFeedForward(nn.Module):
         if self.proj_up_dim <= 0:
             raise ValueError(f"GatedFeedForward: computed proj_up_dim must be strictly positive, got {self.proj_up_dim}")
 
+        if act_fn not in ("gelu", "silu", "swish", "relu"):
+            raise ValueError(f"GatedFeedForward: unsupported act_fn {act_fn!r}. Expected 'gelu', 'silu', 'swish', or 'relu'")
+
         self.d_model = d_model
         self.act_fn = act_fn
         self.num_blocks = num_blocks
@@ -99,5 +105,95 @@ class GatedFeedForward(nn.Module):
         elif self.act_fn == "relu":
             act = F.relu(gate_raw)
         else:
-            act = F.gelu(gate_raw)
+            act = F.silu(gate_raw)
         return self.dropout(self.proj_down(act * up))
+
+
+class SwiGLUFeedForward(nn.Module):
+    """SwiGLU FeedForward layer matching the official xLSTMLarge architecture.
+
+    Computes:
+        y = proj_down(SiLU(proj_up_gate(x)) * proj_up(x))
+
+    Supports both 'single' (separate projection weights) and 'fused' weight modes.
+
+    Args:
+        d_model: Model hidden dimension.
+        proj_factor: Projection expansion factor (e.g. 2.6667). Default: 2.6667.
+        round_up_to_multiple_of: Round the intermediate dimension to the next multiple of this value. Default: 64.
+        proj_up_dim: Explicit intermediate dimension (overrides proj_factor).
+        bias: Whether linear projections include bias. Default: False.
+        weight_mode: Weight parameterization mode ('single' or 'fused'). Default: 'single'.
+        dropout: Dropout probability. Default: 0.0.
+        num_blocks: Total number of stacked blocks in the model (for Wang init). Default: 1.
+    """
+
+    def __init__(
+        self,
+        d_model: int,
+        proj_factor: float = 2.6667,
+        round_up_to_multiple_of: int = 64,
+        proj_up_dim: Optional[int] = None,
+        bias: bool = False,
+        weight_mode: str = "single",
+        dropout: float = 0.0,
+        num_blocks: int = 1,
+    ):
+        super().__init__()
+        if proj_up_dim is not None:
+            self.up_proj_dim = proj_up_dim
+        else:
+            self.up_proj_dim = round_up_to_next_multiple_of(
+                d_model * proj_factor, round_up_to_multiple_of
+            )
+
+        if weight_mode not in ("single", "fused"):
+            raise ValueError(f"SwiGLUFeedForward: unknown weight_mode {weight_mode!r}, expected 'single' or 'fused'")
+
+        self.d_model = d_model
+        self.bias = bias
+        self.weight_mode = weight_mode
+        self.num_blocks = num_blocks
+
+        if weight_mode == "single":
+            self.proj_up_gate = nn.Linear(d_model, self.up_proj_dim, bias=bias)
+            self.proj_up = nn.Linear(d_model, self.up_proj_dim, bias=bias)
+        else:
+            self.proj_up_gate_z = nn.Linear(d_model, 2 * self.up_proj_dim, bias=bias)
+
+        self.proj_down = nn.Linear(self.up_proj_dim, d_model, bias=bias)
+        self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
+
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        """Initializes weights with small_init and wang_init schemes."""
+        if self.weight_mode == "single":
+            small_init_init_(self.proj_up_gate.weight, dim=self.d_model)
+            small_init_init_(self.proj_up.weight, dim=self.d_model)
+            if self.proj_up_gate.bias is not None: nn.init.zeros_(self.proj_up_gate.bias)
+            if self.proj_up.bias is not None: nn.init.zeros_(self.proj_up.bias)
+        else:
+            small_init_init_(self.proj_up_gate_z.weight, dim=self.d_model)
+            if self.proj_up_gate_z.bias is not None: nn.init.zeros_(self.proj_up_gate_z.bias)
+
+        wang_init_(self.proj_down.weight, dim=self.d_model, num_blocks=self.num_blocks)
+        if self.proj_down.bias is not None:
+            nn.init.zeros_(self.proj_down.bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Applies SwiGLU feedforward transformation.
+
+        Args:
+            x: Input tensor of shape (B, T, d_model).
+
+        Returns:
+            Output tensor of shape (B, T, d_model).
+        """
+        if self.weight_mode == "single":
+            act = F.silu(self.proj_up_gate(x)) * self.proj_up(x)
+        else:
+            gate_z = self.proj_up_gate_z(x)
+            gate, z = torch.tensor_split(gate_z, (self.up_proj_dim,), dim=-1)
+            act = F.silu(gate) * z
+        return self.dropout(self.proj_down(act))
